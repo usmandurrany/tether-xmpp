@@ -8,7 +8,7 @@ import javax.naming.directory.InitialDirContext
 /**
  * SRV lookup through the JDK's JNDI DNS provider, using the system resolvers.
  * JNDI does not exist on Android; there this returns no records, so resolution
- * falls back to the domain on port 5222 until the Android resolver lands.
+ * falls back to the domain on port 5222; use [DnsSrvLookup] there instead.
  */
 public class JndiSrvLookup : SrvLookup {
     override suspend fun lookup(name: String): List<SrvRecord> = withContext(Dispatchers.IO) {

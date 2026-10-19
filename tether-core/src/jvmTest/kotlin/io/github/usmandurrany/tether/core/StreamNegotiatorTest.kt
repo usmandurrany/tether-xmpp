@@ -1,10 +1,13 @@
 package io.github.usmandurrany.tether.core
 
 import io.github.usmandurrany.tether.sasl.SaslConfig
+import io.github.usmandurrany.tether.transport.ConscryptTlsProvider
 import io.github.usmandurrany.tether.transport.EndpointResolver
 import io.github.usmandurrany.tether.transport.JvmSocketTransportFactory
+import io.github.usmandurrany.tether.transport.PlatformTlsProvider
 import io.github.usmandurrany.tether.transport.SrvLookup
 import io.github.usmandurrany.tether.transport.TlsConfig
+import io.github.usmandurrany.tether.transport.TlsProvider
 import io.github.usmandurrany.tether.transport.TlsVerificationException
 import kotlinx.coroutines.runBlocking
 import kotlin.test.AfterTest
@@ -43,14 +46,18 @@ class StreamNegotiatorTest {
         responseTimeoutMillis = 5_000,
     )
 
-    private fun negotiate(fake: FakeXmppServer, config: XmppConfig = config(fake.port)): NegotiatedSession {
+    private fun negotiate(
+        fake: FakeXmppServer,
+        config: XmppConfig = config(fake.port),
+        tlsProvider: TlsProvider = PlatformTlsProvider,
+    ): NegotiatedSession {
         server = fake
         val logger = object : TrafficLogger {
             override fun sent(xml: String) { log += "C: $xml" }
             override fun received(xml: String) { log += "S: $xml" }
         }
         return runBlocking {
-            StreamNegotiator(config, JvmSocketTransportFactory(config.tls), EndpointResolver(SrvLookup { emptyList() }), logger).negotiate()
+            StreamNegotiator(config, JvmSocketTransportFactory(config.tls, tlsProvider), EndpointResolver(SrvLookup { emptyList() }), logger).negotiate()
         }.also { it.transport.close() }
     }
 
@@ -76,6 +83,24 @@ class StreamNegotiatorTest {
         assertTrue(session.capabilities.serverSupports("urn:xmpp:carbons:2"))
         assertFalse(session.capabilities.account.available)
         assertTrue(fake.failures.isEmpty(), "server saw: ${fake.failures}")
+    }
+
+    @Test
+    fun conscryptBindsToTheTlsExporter() {
+        val fake = FakeXmppServer(conscrypt = true)
+        val session = negotiate(fake, tlsProvider = ConscryptTlsProvider())
+        assertEquals("TLSv1.3", session.tls.protocol)
+        assertEquals("SCRAM-SHA-256-PLUS", session.saslMechanism)
+        assertEquals("p=tls-exporter,,", fake.usedGs2Header, "RFC 9266 binding is preferred over tls-server-end-point")
+        assertTrue(session.channelBound)
+        assertTrue(fake.failures.isEmpty(), "server saw: ${fake.failures}")
+    }
+
+    @Test
+    fun theJdkFallsBackToTlsServerEndPointWhenTheServerOffersBoth() {
+        val fake = FakeXmppServer(conscrypt = true)
+        negotiate(fake)
+        assertEquals("p=tls-server-end-point,,", fake.usedGs2Header)
     }
 
     @Test

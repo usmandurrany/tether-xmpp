@@ -1,10 +1,14 @@
 [versions]
 kotlin = "2.4.20"
 coroutines = "1.11.0"
+conscrypt = "2.7.0"
 
 [libraries]
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
+
+conscrypt-openjdk = { module = "org.conscrypt:conscrypt-openjdk-uber", version.ref = "conscrypt" }
+conscrypt-android = { module = "org.conscrypt:conscrypt-android", version.ref = "conscrypt" }
 
 [plugins]
 kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }

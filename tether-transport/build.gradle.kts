@@ -19,6 +19,13 @@ kotlin {
         commonTest.dependencies {
             implementation(kotlin("test"))
         }
+        jvmMain.dependencies {
+            // Optional: apps add conscrypt-android or conscrypt-openjdk-uber to get tls-exporter.
+            compileOnly(libs.conscrypt.openjdk)
+        }
+        jvmTest.dependencies {
+            implementation(libs.conscrypt.openjdk)
+        }
     }
 }
 

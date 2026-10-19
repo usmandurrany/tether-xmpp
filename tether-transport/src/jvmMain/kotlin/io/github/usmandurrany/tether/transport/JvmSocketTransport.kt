@@ -4,6 +4,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.InputStream
 import java.io.OutputStream
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.KeyStore
@@ -11,7 +12,6 @@ import java.security.MessageDigest
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
 import javax.net.ssl.SNIHostName
-import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
@@ -25,14 +25,14 @@ import javax.net.ssl.X509TrustManager
  * verification, or against [TlsConfig.pinnedCertificateSha256] when pins are
  * configured.
  */
-public class JvmSocketTransportFactory(private val config: TlsConfig = TlsConfig()) : XmppTransportFactory {
+public class JvmSocketTransportFactory(
+    private val config: TlsConfig = TlsConfig(),
+    private val tlsProvider: TlsProvider = PlatformTlsProvider,
+) : XmppTransportFactory {
     override suspend fun connect(endpoint: Endpoint, serverName: String): XmppTransport = withContext(Dispatchers.IO) {
-        val socket = Socket()
+        val socket = connectAny(endpoint)
         try {
-            socket.tcpNoDelay = true
-            socket.keepAlive = true
-            socket.connect(InetSocketAddress(endpoint.host, endpoint.port), config.connectTimeoutMillis.toInt())
-            val transport = JvmSocketTransport(endpoint, socket, config)
+            val transport = JvmSocketTransport(endpoint, socket, config, tlsProvider)
             if (endpoint.directTls) transport.upgrade(serverName)
             transport
         } catch (t: Throwable) {
@@ -40,12 +40,39 @@ public class JvmSocketTransportFactory(private val config: TlsConfig = TlsConfig
             throw t
         }
     }
+
+    /**
+     * Tries every address of the host in turn, so a broken IPv6 route (common on
+     * mobile networks) falls through to IPv4 instead of failing the endpoint.
+     */
+    private fun connectAny(endpoint: Endpoint): Socket {
+        val addresses = InetAddress.getAllByName(endpoint.host).take(MAX_ADDRESSES)
+        var last: Exception? = null
+        for (address in addresses) {
+            val socket = Socket()
+            try {
+                socket.tcpNoDelay = true
+                socket.keepAlive = true
+                socket.connect(InetSocketAddress(address, endpoint.port), config.connectTimeoutMillis.toInt())
+                return socket
+            } catch (e: Exception) {
+                runCatching { socket.close() }
+                last = e
+            }
+        }
+        throw last ?: java.net.UnknownHostException(endpoint.host)
+    }
+
+    private companion object {
+        const val MAX_ADDRESSES = 4
+    }
 }
 
 internal class JvmSocketTransport(
     override val endpoint: Endpoint,
     private var socket: Socket,
     private val config: TlsConfig,
+    private val tlsProvider: TlsProvider = PlatformTlsProvider,
 ) : XmppTransport {
     private var input: InputStream = socket.getInputStream()
     private var output: OutputStream = socket.getOutputStream()
@@ -74,7 +101,7 @@ internal class JvmSocketTransport(
     internal fun upgrade(serverName: String) {
         check(tls == null) { "TLS is already established" }
         val trust = RecordingTrustManager(config.pinnedCertificateSha256)
-        val context = SSLContext.getInstance("TLS").apply { init(null, arrayOf(trust), null) }
+        val context = tlsProvider.sslContext(trust)
         val ssl = context.socketFactory.createSocket(socket, serverName, endpoint.port, true) as SSLSocket
         ssl.enabledProtocols = ssl.supportedProtocols.filter { it == "TLSv1.3" || it == "TLSv1.2" }.toTypedArray()
         check(ssl.enabledProtocols.isNotEmpty()) { "Neither TLS 1.2 nor TLS 1.3 is available" }
@@ -92,10 +119,22 @@ internal class JvmSocketTransport(
             throw TlsVerificationException("TLS handshake with $serverName failed: ${e.message}", trust.seenFingerprint, e)
         }
         val leaf = ssl.session.peerCertificates.first() as X509Certificate
+        if (config.pinnedCertificateSha256.isEmpty() && !HostnameCheck.matches(leaf, serverName)) {
+            runCatching { ssl.close() }
+            throw TlsVerificationException("The certificate does not name $serverName", sha256Hex(leaf.encoded))
+        }
+        val exporter = try {
+            tlsProvider.tlsExporter(ssl)
+        } catch (e: Exception) {
+            null // Without it, SCRAM falls back to tls-server-end-point or no binding.
+        }
         socket = ssl
         input = ssl.inputStream
         output = ssl.outputStream
-        channelBindings = listOfNotNull(tlsServerEndPoint(leaf))
+        channelBindings = listOfNotNull(
+            exporter?.let { TlsChannelBinding("tls-exporter", it) },
+            tlsServerEndPoint(leaf),
+        )
         tls = TlsInfo(
             protocol = ssl.session.protocol,
             cipherSuite = ssl.session.cipherSuite,
@@ -146,7 +185,7 @@ private class RecordingTrustManager(private val pins: Set<String>) : X509TrustMa
  * binding is undefined.
  *
  * `tls-exporter` (RFC 9266) needs keying-material export, which the JDK does not
- * expose; the Android transport will add it through Conscrypt.
+ * expose; [ConscryptTlsProvider] adds it.
  */
 internal fun tlsServerEndPoint(certificate: X509Certificate): TlsChannelBinding? {
     val algorithm = certificate.sigAlgName.uppercase()
