@@ -346,7 +346,10 @@ public class XmppClient(
                         session.request(iq, timeoutMillis, ordered = true)
                 }
                 for (extension in extensions) extension.onSessionStarted(context)
-                if (!foreground.value) reportActivity(session, false)
+                // A new session starts active. A resumed one keeps whatever the server last
+                // heard, which may be from before the app came back (or from an earlier run),
+                // so it is told the current state either way.
+                if (session.resumed || !foreground.value) reportActivity(session, foreground.value)
                 sending.withLock {
                     while (outbox.isNotEmpty()) {
                         if (!session.offer(outbox.first())) {

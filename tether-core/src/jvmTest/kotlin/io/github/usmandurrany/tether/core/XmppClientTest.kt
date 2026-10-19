@@ -64,6 +64,17 @@ class XmppClientTest {
     private fun FakeXmppServer.nextFromClient(): Element =
         assertNotNull(fromClient.poll(5, TimeUnit.SECONDS), "server received nothing")
 
+    /** The next message, presence or iq, skipping CSI reports (a resumed session always sends one). */
+    private fun FakeXmppServer.nextStanzaFromClient(timeoutMillis: Long = 5_000): Element? {
+        val deadline = System.currentTimeMillis() + timeoutMillis
+        while (true) {
+            val left = deadline - System.currentTimeMillis()
+            if (left <= 0) return null
+            val next = fromClient.poll(left, TimeUnit.MILLISECONDS) ?: return null
+            if (next.namespace != Ns.CSI) return next
+        }
+    }
+
     @Test
     fun stanzasSentWhileOfflineGoOutOnTheNextSession() = runBlocking<Unit> {
         val fake = FakeXmppServer(streamManagement = true)
@@ -167,6 +178,23 @@ class XmppClientTest {
     }
 
     @Test
+    fun aResumedSessionIsToldTheCurrentActivity() = runBlocking<Unit> {
+        val fake = FakeXmppServer(streamManagement = true)
+        val client = client(fake, ClientPolicy(reconnect = ReconnectPolicy(backgroundMode = BackgroundMode.STAY_CONNECTED, stableSessionMillis = 0)))
+        withTimeout(10_000) { client.connect() }
+        client.setForeground(false)
+        assertEquals("inactive", fake.nextFromClient().name)
+        // The app comes back while the connection is down: the server still has "inactive".
+        fake.dropConnection()
+        withTimeout(10_000) { while (client.state.value is ConnectionState.Online) delay(5) }
+        client.setForeground(true)
+        withTimeout(10_000) { while (client.state.value !is ConnectionState.Online) delay(20) }
+        assertEquals(1, fake.resumes)
+        val names = generateSequence { fake.fromClient.poll(2, TimeUnit.SECONDS) }.map { it.name }.take(5).toList()
+        assertTrue("active" in names, "sent after resuming: $names")
+    }
+
+    @Test
     fun aDroppedConnectionLosesNothingSentAroundIt() = runBlocking<Unit> {
         val fake = FakeXmppServer(streamManagement = true, silent = true)
         val client = client(fake, ClientPolicy(reconnect = ReconnectPolicy(stableSessionMillis = 0)))
@@ -177,10 +205,10 @@ class XmppClientTest {
         fake.silent = false
         fake.dropConnection()
         client.send(message("during", id = "d")) // the session may or may not have noticed yet
-        val ids = List(2) { fake.nextFromClient().attribute("id") }
+        val ids = List(2) { fake.nextStanzaFromClient()?.attribute("id") }
         assertEquals(listOf("b", "d"), ids, "the lost one is re-sent first, then the new one, each once")
         withTimeout(10_000) { while (client.state.value !is ConnectionState.Online) delay(20) }
-        assertEquals(null, fake.fromClient.poll(300, TimeUnit.MILLISECONDS))
+        assertEquals(null, fake.nextStanzaFromClient(300))
     }
 
     @Test
@@ -203,8 +231,8 @@ class XmppClientTest {
         val second = client(fake, store = store)
         withTimeout(10_000) { second.connect() }
         assertEquals(1, fake.resumes, "resumed from the saved state, no new login")
-        assertEquals("s2", fake.nextFromClient().attribute("id"), "only what the server never got is sent again")
-        assertEquals(null, fake.fromClient.poll(300, TimeUnit.MILLISECONDS))
+        assertEquals("s2", fake.nextStanzaFromClient()?.attribute("id"), "only what the server never got is sent again")
+        assertEquals(null, fake.nextStanzaFromClient(300))
     }
 
     @Test

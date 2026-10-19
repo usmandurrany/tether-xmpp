@@ -87,9 +87,22 @@ public class Presences(
     /** Collect before connecting: requests that arrive with no collector are dropped (the server re-sends them on the next login). */
     public val subscriptions: SharedFlow<SubscriptionEvent> = _subscriptions.asSharedFlow()
 
+    /** False until this process has seen a session: a resumed one then carries no presence we know of. */
+    @Volatile
+    private var started = false
+
     override suspend fun onSessionStarted(session: SessionContext) {
-        if (session.resumed) return
+        val firstInProcess = !started
+        started = true
+        if (session.resumed && !firstInProcess) return // Both sides kept their presence state.
         _contacts.value = emptyMap()
+        if (session.resumed) {
+            // An app restart resumed the saved session: the server still has our presence,
+            // but this process never saw the contacts'. Going unavailable and back makes the
+            // next presence initial again (RFC 6121 §4.2), so the server probes the contacts.
+            if (!announced) return
+            session.send(element("presence", ImNs.CLIENT) { attribute("type", "unavailable") })
+        }
         if (announced) session.send(presenceStanza(own))
     }
 

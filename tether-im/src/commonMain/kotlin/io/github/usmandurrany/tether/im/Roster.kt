@@ -66,7 +66,8 @@ public class Roster(
 
     override suspend fun onSessionStarted(session: SessionContext) {
         own = session.jid.bare
-        if (session.resumed) return // The server kept the session; pushes kept the list current.
+        // Load the saved list first, also for a resumed session: after an app restart
+        // the session can resume (saved XEP-0198 state) while this process has no list yet.
         if (!loaded) {
             store?.load()?.let { snapshot ->
                 version = snapshot.version
@@ -74,6 +75,7 @@ public class Roster(
             }
             loaded = true
         }
+        if (session.resumed) return // The server kept the session; pushes kept the list current.
         val versioning = store != null && session.capabilities.hasStreamFeature("ver", ImNs.ROSTER_VER)
         val answer = session.request(
             iq("get") {

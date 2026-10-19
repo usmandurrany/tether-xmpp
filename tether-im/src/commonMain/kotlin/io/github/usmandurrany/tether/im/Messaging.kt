@@ -242,8 +242,18 @@ public class Carbons : ClientExtension {
     private val _enabled = MutableStateFlow(false)
     public val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
 
+    @Volatile
+    private var started = false
+
     override suspend fun onSessionStarted(session: SessionContext) {
-        if (session.resumed) return // Still enabled on the server's side.
+        val firstInProcess = !started
+        started = true
+        if (session.resumed) {
+            // Still enabled on the server's side. After an app restart that resumed the
+            // saved session, the earlier run enabled it whenever the server offers it.
+            if (firstInProcess) _enabled.value = session.capabilities.serverSupports(ImNs.CARBONS)
+            return
+        }
         _enabled.value = false
         if (!session.capabilities.serverSupports(ImNs.CARBONS)) return
         val answer = session.request(iq("set") { element("enable", ImNs.CARBONS) })

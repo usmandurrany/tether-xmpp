@@ -38,6 +38,16 @@ class RosterTest {
     }
 
     @Test
+    fun aSessionResumedAfterARestartShowsTheSavedList() = runTest {
+        val sender = FakeSender()
+        val saved = RosterSnapshot("7", listOf(RosterItem(romeo, "Romeo", Subscription.BOTH)))
+        val roster = Roster(sender, MemoryStore(saved))
+        roster.onSessionStarted(FakeSession(sender, resumed = true))
+        assertTrue(sender.requests.isEmpty())
+        assertEquals("Romeo", roster.items.value[romeo]?.name)
+    }
+
+    @Test
     fun pushesFromTheAccountUpdateTheListAndAreAnswered() = runTest {
         val sender = FakeSender(rosterResult())
         val roster = Roster(sender)
