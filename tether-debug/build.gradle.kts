@@ -11,7 +11,6 @@ kotlin {
         // Java 17 bytecode keeps the module usable on Android (API 26+) and current JVMs.
         compilerOptions { jvmTarget.set(JvmTarget.JVM_17) }
     }
-    linuxX64()
 
     compilerOptions {
         optIn.add("kotlin.concurrent.atomics.ExperimentalAtomicApi")

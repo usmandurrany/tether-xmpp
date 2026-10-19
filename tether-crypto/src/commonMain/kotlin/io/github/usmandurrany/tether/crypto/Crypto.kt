@@ -8,8 +8,9 @@ public enum class HashAlgorithm(public val outputBytes: Int, internal val blockB
 }
 
 /**
- * Platform crypto primitives. JVM and Android use JCA; Kotlin/Native uses
- * [PureHashes] for hashing and the kernel's CSPRNG for random bytes.
+ * Platform crypto primitives. JVM and Android use JCA. [PureHashes] and
+ * [hmacWith] stay in common code for future targets without a synchronous
+ * crypto provider.
  */
 public expect object Crypto {
     public fun hash(algorithm: HashAlgorithm, data: ByteArray): ByteArray

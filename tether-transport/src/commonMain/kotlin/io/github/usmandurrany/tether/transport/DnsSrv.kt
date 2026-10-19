@@ -2,7 +2,7 @@ package io.github.usmandurrany.tether.transport
 
 /**
  * DNS wire format for SRV lookups (RFC 1035, RFC 2782), for platforms without a
- * system SRV API (Android, Kotlin/Native). Only what an SRV query needs: one
+ * system SRV API (Android). Only what an SRV query needs: one
  * question, and answers with name compression.
  */
 public object DnsSrv {
