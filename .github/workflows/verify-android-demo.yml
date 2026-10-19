@@ -40,7 +40,10 @@ jobs:
   smoke:
     needs: apk
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: tether-demo-debug
@@ -70,13 +73,17 @@ jobs:
             adb exec-out screencap -p > settings-bottom.png
             adb logcat -d > logcat.txt
             adb shell pidof io.github.usmandurrany.tether.demo
-      - uses: actions/upload-artifact@v4
+      - name: Keep the screenshots on the branch for review
         if: always()
-        with:
-          name: smoke-screenshots
-          path: |
-            *.png
-            logcat.txt
+        run: |
+          mkdir -p .verify/screens
+          cp -f *.png .verify/screens/ 2>/dev/null || true
+          grep -E "AndroidRuntime|FATAL" logcat.txt > .verify/screens/crashes.txt || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .verify/screens
+          git commit -m "Smoke-test screenshots" || exit 0
+          git pull --rebase origin "$GITHUB_REF_NAME" && git push origin "HEAD:$GITHUB_REF_NAME"
 
   # Signs in through the UI against a real ejabberd, trusts its self-signed
   # certificate, and exchanges messages with a second account.
@@ -113,6 +120,7 @@ jobs:
           target: google_apis
           arch: x86_64
           disable-animations: true
+          emulator-boot-timeout: 900
           working-directory: ${{ env.DEMO }}
           script: ./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.xmppHost=10.0.2.2 -Pandroid.testInstrumentationRunnerArguments.xmppDomain=localhost -Pandroid.testInstrumentationRunnerArguments.xmppPassword=secret --stacktrace
       - name: Server log
