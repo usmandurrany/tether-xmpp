@@ -1,0 +1,86 @@
+2026-10-19 21:00:42.003 [info] Loading configuration from /opt/ejabberd/conf/ejabberd.yml
+2026-10-19 21:00:42.428 [info] Configuration loaded successfully
+2026-10-19 21:00:42.533 [info] Got no NOTIFY_SOCKET, notifications disabled
+2026-10-19 21:00:42.544 [info] Building language translation cache
+2026-10-19 21:00:42.846 [info] Creating Mnesia ram table 'ejabberd_commands'
+2026-10-19 21:00:42.861 [info] Creating a Unix Domain Socket provisional file at ../sockets/g2gCbQAAAAhyDQVY9QMRpm0AAAAdLi4vc29ja2V0cy9jdGxfb3Zlcl9odHRwLnNvY2s= for the definitive path ../sockets/ctl_over_http.sock
+2026-10-19 21:00:42.887 [info] Creating Mnesia ram table 'route'
+2026-10-19 21:00:42.892 [info] Creating Mnesia ram table 'route_multicast'
+2026-10-19 21:00:43.025 [info] Creating Mnesia ram table 'session'
+2026-10-19 21:00:43.032 [info] Creating Mnesia ram table 's2s'
+2026-10-19 21:00:43.035 [info] Creating Mnesia ram table 'temporarily_blocked'
+2026-10-19 21:00:43.040 [info] Loading modules for localhost
+2026-10-19 21:00:43.040 [info] Creating Mnesia disc_only table 'offline_msg'
+2026-10-19 21:00:43.122 [info] Creating Mnesia ram table 'mod_register_ip'
+2026-10-19 21:00:43.133 [info] Going to offer STUN/TURN service: 172.17.0.2:5478 (udp)
+2026-10-19 21:00:43.141 [info] Creating Mnesia disc table 'sr_group'
+2026-10-19 21:00:43.145 [info] Creating Mnesia disc table 'sr_user'
+2026-10-19 21:00:43.155 [info] Creating Mnesia disc_only table 'vcard'
+2026-10-19 21:00:43.315 [info] Creating Mnesia disc table 'vcard_search'
+2026-10-19 21:00:43.340 [info] Creating Mnesia ram table 'bytestream'
+2026-10-19 21:00:43.344 [warning] Mnesia backend for mod_mam is not recommended: it's limited to 2GB and often gets corrupted when reaching this limit. SQL backend is recommended. Namely, for small servers SQLite is a preferred choice because it's very easy to configure.
+2026-10-19 21:00:43.345 [info] Creating Mnesia disc_only table 'archive_msg'
+2026-10-19 21:00:43.347 [info] Creating Mnesia disc_only table 'archive_prefs'
+2026-10-19 21:00:43.666 [info] Creating Mnesia disc table 'muc_room'
+2026-10-19 21:00:43.694 [info] Creating Mnesia disc table 'muc_registered'
+2026-10-19 21:00:43.845 [info] Creating Mnesia ram table 'muc_online_room'
+2026-10-19 21:00:43.865 [info] Creating Mnesia disc_only table 'motd'
+2026-10-19 21:00:43.925 [info] Creating Mnesia disc_only table 'motd_users'
+2026-10-19 21:00:44.025 [info] Creating Mnesia disc_only table 'caps_features'
+2026-10-19 21:00:44.053 [info] Creating Mnesia ram table 'pubsub_last_item'
+2026-10-19 21:00:44.071 [info] Creating Mnesia disc table 'pubsub_index'
+2026-10-19 21:00:44.088 [info] Creating Mnesia disc table 'pubsub_node'
+2026-10-19 21:00:44.102 [info] Creating Mnesia disc table 'pubsub_state'
+2026-10-19 21:00:44.124 [info] Creating Mnesia disc_only table 'pubsub_item'
+2026-10-19 21:00:44.205 [info] Creating Mnesia disc table 'pubsub_orphan'
+2026-10-19 21:00:44.209 [info] Creating Mnesia disc_only table 'private_storage'
+2026-10-19 21:00:44.259 [info] Creating Mnesia disc_only table 'roster'
+2026-10-19 21:00:44.270 [info] Creating Mnesia disc_only table 'roster_version'
+2026-10-19 21:00:44.301 [info] Creating Mnesia disc_only table 'privacy'
+2026-10-19 21:00:44.327 [info] Creating Mnesia ram table 'bosh'
+2026-10-19 21:00:44.330 [info] Creating Mnesia disc_only table 'push_session'
+2026-10-19 21:00:44.351 [info] Creating Mnesia disc_only table 'last_activity'
+2026-10-19 21:00:44.364 [info] Creating Mnesia disc_only table 'mqtt_pub'
+2026-10-19 21:00:44.371 [info] Creating Mnesia ram table 'mqtt_session'
+2026-10-19 21:00:44.374 [info] Creating Mnesia ram table 'mqtt_sub'
+2026-10-19 21:00:44.391 [info] Building MQTT cache for localhost, this may take a while
+2026-10-19 21:00:44.392 [warning] The option captcha_cmd is not configured, but some module wants to use the CAPTCHA feature.
+2026-10-19 21:00:44.397 [info] Creating Mnesia disc_only table 'passwd'
+2026-10-19 21:00:44.401 [info] Creating Mnesia ram table 'reg_users_counter'
+2026-10-19 21:00:44.418 [info] Creating Mnesia disc_only table 'oauth_token'
+2026-10-19 21:00:44.421 [info] Creating Mnesia disc table 'oauth_client'
+2026-10-19 21:00:44.446 [info] Waiting for Mnesia synchronization to complete
+2026-10-19 21:00:44.469 [warning] Invalid certificate in /opt/ejabberd/conf/server.pem: at line 53: self-signed certificate
+2026-10-19 21:00:44.496 [warning] No certificate found matching pubsub.localhost
+2026-10-19 21:00:44.497 [warning] No certificate found matching proxy.localhost
+2026-10-19 21:00:44.497 [warning] No certificate found matching upload.localhost
+2026-10-19 21:00:44.497 [warning] No certificate found matching conference.localhost
+2026-10-19 21:00:44.498 [info] ejabberd 26.9.0 is started in the node :ejabberd@localhost in 2.56s
+2026-10-19 21:00:44.529 [info] Elixir 1.19.6 (compiled with Erlang/OTP 28)
+2026-10-19 21:00:44.529 [info] Erlang/OTP 28 [erts-16.4.0.2] [source] [64-bit] [smp:2:2] [ds:2:2:10] [async-threads:1] [jit:ns]
+
+2026-10-19 21:00:44.529 [info] Start accepting TCP connections at 0.0.0.0:33839 for erlang distribution
+2026-10-19 21:00:44.531 [info] Start accepting TCP connections at [::]:5222 for :ejabberd_c2s
+2026-10-19 21:00:44.531 [info] Start accepting TLS connections at [::]:5223 for :ejabberd_c2s
+2026-10-19 21:00:44.531 [info] Start accepting TCP connections at [::]:1880 for :ejabberd_http
+2026-10-19 21:00:44.531 [info] Start accepting TCP connections at [::]:5280 for :ejabberd_http
+2026-10-19 21:00:44.532 [info] Start accepting UDP connections at [::]:5478 for :ejabberd_stun
+2026-10-19 21:00:44.532 [info] Start accepting TCP connections at unix:/opt/ejabberd/database/../sockets/ctl_over_http.sock for :ejabberd_http
+2026-10-19 21:00:44.532 [info] Start accepting TCP connections at [::]:1883 for :mod_mqtt
+2026-10-19 21:00:44.532 [info] Start accepting TCP connections at 172.17.0.2:7777 for :mod_proxy65_stream
+2026-10-19 21:00:44.531 [info] Start accepting TLS connections at [::]:5443 for :ejabberd_http
+2026-10-19 21:00:44.531 [info] Start accepting TCP connections at [::]:5269 for :ejabberd_s2s_in
+2026-10-19 21:01:10.385 [info] (#PID<0.869.0>) Accepted connection [::ffff:172.17.0.1]:43202 -> [::ffff:172.17.0.2]:5222
+2026-10-19 21:01:11.637 [info] (tls|<0.869.0>) Failed to secure c2s connection: TLS failed: SSL_do_handshake failed: error:0A000416:SSL routines::ssl/tls alert certificate unknown
+2026-10-19 21:01:11.707 [info] (#PID<0.872.0>) Accepted connection [::ffff:172.17.0.1]:43212 -> [::ffff:172.17.0.2]:5222
+2026-10-19 21:01:11.849 [info] (tls|<0.872.0>) Failed to secure c2s connection: TLS failed: SSL_do_handshake failed: error:0A000416:SSL routines::ssl/tls alert certificate unknown
+2026-10-19 21:01:12.727 [info] (#PID<0.873.0>) Accepted connection [::ffff:172.17.0.1]:43224 -> [::ffff:172.17.0.2]:5222
+2026-10-19 21:01:13.525 [info] (#PID<0.874.0>) Accepted connection [::ffff:172.17.0.1]:43226 -> [::ffff:172.17.0.2]:5222
+2026-10-19 21:01:15.092 [info] (tls|<0.874.0>) Accepted c2s SCRAM-SHA-512-PLUS authentication for alice@localhost by mnesia backend from ::ffff:172.17.0.1
+2026-10-19 21:01:15.169 [info] (tls|<0.874.0>) Opened c2s session for alice@localhost/119623775177736325271602
+2026-10-19 21:01:17.083 [info] (#PID<0.875.0>) Accepted connection [::ffff:172.17.0.1]:43242 -> [::ffff:172.17.0.2]:5222
+2026-10-19 21:01:17.979 [info] (#PID<0.876.0>) Accepted connection [::ffff:172.17.0.1]:43256 -> [::ffff:172.17.0.2]:5222
+2026-10-19 21:01:18.843 [info] (tls|<0.876.0>) Accepted c2s SCRAM-SHA-512-PLUS authentication for bob@localhost by mnesia backend from ::ffff:172.17.0.1
+2026-10-19 21:01:18.902 [info] (tls|<0.876.0>) Opened c2s session for bob@localhost/108528825687673825991650
+2026-10-19 21:01:21.362 [info] (tls|<0.876.0>) Closing c2s session for bob@localhost/108528825687673825991650: Stream reset by peer
+2026-10-19 21:01:23.429 [info] (tls|<0.874.0>) Closing c2s connection for alice@localhost/119623775177736325271602: Connection failed: connection closed; waiting 300 seconds for stream resumption
