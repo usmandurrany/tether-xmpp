@@ -41,6 +41,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -160,7 +161,7 @@ fun ChatScreen(session: TetherSession, peer: BareJid, onBack: () -> Unit) {
                     onValueChange = { text = it },
                     placeholder = { Text("Message") },
                     maxLines = 4,
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.weight(1f).testTag("message-input"),
                 )
                 Spacer(Modifier.width(8.dp))
                 Button(

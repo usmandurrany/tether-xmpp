@@ -77,3 +77,49 @@ jobs:
           path: |
             *.png
             logcat.txt
+
+  # Signs in through the UI against a real ejabberd, trusts its self-signed
+  # certificate, and exchanges messages with a second account.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Lay out the demo with the SDK as its submodule
+        run: |
+          demo="$RUNNER_TEMP/tether-demo-android"
+          cp -r .verify/tether-demo-android "$demo"
+          mkdir "$demo/tether-xmpp"
+          rsync -a --exclude .verify --exclude .git ./ "$demo/tether-xmpp/"
+          echo "DEMO=$demo" >> "$GITHUB_ENV"
+      - name: Start ejabberd with two accounts
+        run: |
+          docker run -d --name ejabberd -p 5222:5222 ghcr.io/processone/ejabberd:latest
+          for i in $(seq 90); do docker exec ejabberd ejabberdctl status >/dev/null 2>&1 && break; sleep 2; done
+          docker exec ejabberd ejabberdctl register alice localhost secret
+          docker exec ejabberd ejabberdctl register bob localhost secret
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          working-directory: ${{ env.DEMO }}
+          script: ./gradlew connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.xmppHost=10.0.2.2 -Pandroid.testInstrumentationRunnerArguments.xmppDomain=localhost -Pandroid.testInstrumentationRunnerArguments.xmppPassword=secret --stacktrace
+      - name: Server log
+        if: always()
+        run: docker logs ejabberd 2>&1 | tail -100
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-reports
+          path: ${{ env.DEMO }}/app/build/reports/androidTests/
