@@ -30,6 +30,13 @@ public interface StanzaSender {
 
     /** Sends an IQ get/set and returns the server's result or error answer. */
     public suspend fun request(iq: Element, timeoutMillis: Long = 30_000): Element
+
+    /**
+     * Like [request], but returns only after every stanza that arrived before
+     * the answer has been through the extensions. For queries whose results
+     * come as separate stanzas before the answer, such as archive queries.
+     */
+    public suspend fun requestInOrder(iq: Element, timeoutMillis: Long = 30_000): Element = request(iq, timeoutMillis)
 }
 
 /**
@@ -191,12 +198,16 @@ public class XmppClient(
      * in total for a session first. A session that ends before the answer
      * arrives fails the request; the caller decides whether to retry.
      */
-    override suspend fun request(iq: Element, timeoutMillis: Long): Element {
+    override suspend fun request(iq: Element, timeoutMillis: Long): Element = request(iq, timeoutMillis, ordered = false)
+
+    override suspend fun requestInOrder(iq: Element, timeoutMillis: Long): Element = request(iq, timeoutMillis, ordered = true)
+
+    private suspend fun request(iq: Element, timeoutMillis: Long, ordered: Boolean): Element {
         val start = TimeSource.Monotonic.markNow()
         val live = withTimeoutOrNull(timeoutMillis) { _session.filterNotNull().first() }
             ?: throw XmppNegotiationException(NegotiationFailure.CONNECTION_LOST, "Not connected")
         val left = (timeoutMillis - start.elapsedNow().inWholeMilliseconds).coerceAtLeast(1)
-        return live.request(iq, left)
+        return live.request(iq, left, ordered)
     }
 
     /** Stanzas waiting for a session, oldest first. */
@@ -248,6 +259,8 @@ public class XmppClient(
                     override val resumed: Boolean get() = session.resumed
                     override suspend fun send(stanza: Element): Unit = session.send(stanza)
                     override suspend fun request(iq: Element, timeoutMillis: Long): Element = session.request(iq, timeoutMillis)
+                    override suspend fun requestInOrder(iq: Element, timeoutMillis: Long): Element =
+                        session.request(iq, timeoutMillis, ordered = true)
                 }
                 for (extension in extensions) extension.onSessionStarted(context)
                 if (!foreground.value) reportActivity(session, false)

@@ -125,6 +125,31 @@ class XmppClientTest {
     }
 
     @Test
+    fun anOrderedRequestReturnsAfterTheStanzasThatPrecededItsAnswer() = runBlocking<Unit> {
+        val fake = FakeXmppServer(streamManagement = true)
+        val client = client(fake)
+        val seen = java.util.Collections.synchronizedList(ArrayList<String>())
+        client.install(object : ClientExtension {
+            override suspend fun onStanza(stanza: Element): Boolean {
+                val body = stanza.child("body")?.text ?: return false
+                delay(20) // a slow extension: the answer must still wait for it
+                seen += body
+                return true
+            }
+        })
+        withTimeout(10_000) { client.connect() }
+        seen.clear()
+        fake.beforeAccountAnswer = (1..5).map { "<message from='juliet@localhost'><body>r$it</body></message>" }
+        val query = element("iq", Ns.CLIENT) {
+            attribute("type", "set")
+            attribute("to", "juliet@localhost")
+            element("query", "urn:xmpp:mam:2")
+        }
+        withTimeout(10_000) { client.requestInOrder(query) }
+        assertEquals(listOf("r1", "r2", "r3", "r4", "r5"), seen.toList().filter { it != "welcome" })
+    }
+
+    @Test
     fun reportsActivityWithCsiWhenTheServerOffersIt() = runBlocking<Unit> {
         val fake = FakeXmppServer(streamManagement = true)
         val client = client(fake, ClientPolicy(reconnect = ReconnectPolicy(backgroundMode = BackgroundMode.STAY_CONNECTED)))

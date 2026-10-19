@@ -34,6 +34,7 @@ include(":tether-crypto")
 include(":tether-sasl")
 include(":tether-transport")
 include(":tether-core")
+include(":tether-im")
 include(":tools:probe")
 
 // The Android module needs the Android SDK and Google's Maven repository. Builds

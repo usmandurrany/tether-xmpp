@@ -10,6 +10,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.transform
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -57,9 +58,14 @@ public class XmppSession private constructor(
 
     /** Guards writes and all SM, IQ and probe bookkeeping, so counters match what went on the wire. */
     private val lock = Mutex()
-    private val pendingIqs = HashMap<String, CompletableDeferred<Element>>()
+    private class PendingIq(val answer: CompletableDeferred<Element>, val ordered: Boolean)
+
+    /** An ordered answer travels with the incoming stanzas, so it is seen after everything that came before it. */
+    private class OrderedAnswer(val waiter: CompletableDeferred<Element>, val answer: Element)
+
+    private val pendingIqs = HashMap<String, PendingIq>()
     private val ackWaiters = ArrayList<CompletableDeferred<Unit>>()
-    private val incomingChannel = Channel<Element>(policy.incomingBuffer)
+    private val incomingChannel = Channel<Any>(policy.incomingBuffer)
     private val ended = CompletableDeferred<Throwable?>()
     private var loopStarted = false
     private var idCounter = 0
@@ -69,7 +75,9 @@ public class XmppSession private constructor(
     private var closed = false
 
     /** Stanzas from the server that the app should handle (messages, presence, IQ requests). */
-    public val incoming: Flow<Element> = incomingChannel.receiveAsFlow()
+    public val incoming: Flow<Element> = incomingChannel.receiveAsFlow().transform { item ->
+        if (item is OrderedAnswer) item.waiter.complete(item.answer) else emit(item as Element)
+    }
 
     /**
      * Sends a message, presence or IQ. An `id` is added when missing, so a
@@ -121,13 +129,20 @@ public class XmppSession private constructor(
     }
 
     /** Sends an IQ get/set and waits for its result or error. */
-    public suspend fun request(iq: Element, timeoutMillis: Long = 30_000): Element {
+    public suspend fun request(iq: Element, timeoutMillis: Long = 30_000): Element = request(iq, timeoutMillis, ordered = false)
+
+    /**
+     * With [ordered], the answer is handed over only once every stanza received
+     * before it has been taken from [incoming], for queries whose results arrive
+     * as separate stanzas first (XEP-0313). Needs a collector of [incoming].
+     */
+    internal suspend fun request(iq: Element, timeoutMillis: Long, ordered: Boolean): Element {
         require(iq.name == "iq" && iq.namespace == Ns.CLIENT && iq.attribute("type") in setOf("get", "set"))
         val stanza = withId(iq)
         val id = stanza.attribute("id")!!
         val answer = CompletableDeferred<Element>()
         lock.withLock {
-            pendingIqs[id] = answer
+            pendingIqs[id] = PendingIq(answer, ordered)
             sendLocked(stanza)
         }
         try {
@@ -237,8 +252,8 @@ public class XmppSession private constructor(
         if (stanza.name == "iq") {
             when (stanza.attribute("type")) {
                 "result", "error" -> {
-                    val waiter = lock.withLock { pendingIqs.remove(stanza.attribute("id")) }
-                    waiter?.complete(stanza)
+                    val waiter = lock.withLock { pendingIqs.remove(stanza.attribute("id")) } ?: return
+                    if (waiter.ordered) incomingChannel.send(OrderedAnswer(waiter.answer, stanza)) else waiter.answer.complete(stanza)
                     return
                 }
                 "get" -> if (stanza.child("ping", Ns.PING) != null) {
@@ -306,7 +321,7 @@ public class XmppSession private constructor(
 
     private fun finishLocked(cause: Throwable?) {
         val error = XmppNegotiationException(NegotiationFailure.CONNECTION_LOST, "Session closed", cause = cause)
-        pendingIqs.values.forEach { it.completeExceptionally(error) }
+        pendingIqs.values.forEach { it.answer.completeExceptionally(error) }
         pendingIqs.clear()
         ackWaiters.forEach { it.completeExceptionally(error) }
         ackWaiters.clear()
