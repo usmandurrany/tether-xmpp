@@ -261,7 +261,7 @@ internal class FakeXmppServer(
                 }
                 continue
             }
-            if (smOn) smInbound++
+            if (smOn && el.namespace == "jabber:client") smInbound++
             when {
                 el.child("bind", "urn:ietf:params:xml:ns:xmpp-bind") != null ->
                     c.send("<iq type='result' id='$id'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>$bindJid</jid></bind></iq>")
