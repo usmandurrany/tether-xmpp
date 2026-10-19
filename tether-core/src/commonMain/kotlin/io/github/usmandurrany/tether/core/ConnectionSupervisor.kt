@@ -16,10 +16,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.random.Random
 import kotlin.time.TimeSource
 
-/**
- * An authenticated stream as the supervisor sees it. The stream layer (plain
- * session today, Stream Management next) implements this.
- */
+/** An authenticated stream as the supervisor sees it. [XmppSession] implements it. */
 public interface LiveSession {
     public val jid: FullJid
 
@@ -35,6 +32,16 @@ public interface LiveSession {
 
     /** Closes the stream. Must be idempotent and must not suspend. */
     public fun close()
+
+    /**
+     * Ends the stream politely (flush, then `</stream:stream>`) so the server
+     * drops the session instead of keeping it resumable. Used by
+     * [ConnectionSupervisor.disconnect]; the supervisor applies a timeout and
+     * calls [close] afterwards either way.
+     */
+    public suspend fun closeGracefully() {
+        close()
+    }
 }
 
 /** Opens one session. Must clean up after itself when cancelled or when it fails. */
@@ -58,6 +65,13 @@ public sealed interface ConnectionState {
     /** Waiting before the next attempt. */
     public data class Backoff(val attempt: Int, val delayMillis: Long, val lastError: Throwable?) : ConnectionState
 
+    /**
+     * Wanted, but closed on purpose because the app is in the background
+     * ([BackgroundMode.CLOSE] or [BackgroundMode.DETACH]). Reconnects when the
+     * app returns to the foreground, or on an explicit [ConnectionSupervisor.connect].
+     */
+    public data object Paused : ConnectionState
+
     /** Stopped on an error retrying cannot fix (bad credentials, certificate, conflict). Only [ConnectionSupervisor.connect] restarts. */
     public data class Terminal(val error: Throwable) : ConnectionState
 }
@@ -68,6 +82,27 @@ public sealed interface ConnectResult {
     public data class Failed(val error: Throwable) : ConnectResult
     /** [ConnectionSupervisor.disconnect] was called before the connection came up. */
     public data object Cancelled : ConnectResult
+}
+
+/** What happens to the connection while the app is in the background. */
+public enum class BackgroundMode {
+    /**
+     * End the session cleanly (`</stream:stream>`). The server marks the account
+     * offline at once, so new messages go to offline storage and push
+     * notifications (XEP-0357) on every server. Coming back is a fresh login.
+     */
+    CLOSE,
+
+    /**
+     * Cut the socket but keep the XEP-0198 session resumable. The server sees
+     * the drop at once and holds the session for its resume window; coming back
+     * resumes without a login and replays what was missed. Whether the server
+     * sends push notifications for a held session depends on the server.
+     */
+    DETACH,
+
+    /** Keep the connection; the app should mark it inactive with CSI (XEP-0352). */
+    STAY_CONNECTED,
 }
 
 /** Timing for reconnects and liveness checks (design §4.3, §4.4). */
@@ -83,10 +118,25 @@ public data class ReconnectPolicy(
      * cannot cause a tight reconnect loop. Later drops reconnect immediately.
      */
     val stableSessionMillis: Long = 30_000,
+    /** In the background the radio is costlier and the OS stricter: wait longer between retries. */
+    val backgroundMaxDelayMillis: Long = 600_000,
+    /** Background networks are often slower to wake; give probes longer. */
+    val backgroundProbeTimeoutMillis: Long = 20_000,
+    /** Upper bound for [ConnectionSupervisor.disconnect]'s polite close before the socket is cut. */
+    val gracefulCloseMillis: Long = 5_000,
+    val backgroundMode: BackgroundMode = BackgroundMode.CLOSE,
+    /**
+     * How long the app must stay in the background before the connection is
+     * closed, so a quick switch to the camera or share sheet does not cause a
+     * disconnect, a push, and a reconnect. 0 closes immediately.
+     */
+    val backgroundCloseDelayMillis: Long = 5_000,
 ) {
     init {
         require(baseDelayMillis > 0 && maxDelayMillis >= baseDelayMillis) { "Invalid backoff bounds" }
-        require(probeTimeoutMillis > 0 && stableSessionMillis >= 0) { "Invalid timeouts" }
+        require(backgroundMaxDelayMillis >= baseDelayMillis) { "Invalid background backoff" }
+        require(probeTimeoutMillis > 0 && backgroundProbeTimeoutMillis > 0 && stableSessionMillis >= 0) { "Invalid timeouts" }
+        require(gracefulCloseMillis >= 0 && backgroundCloseDelayMillis >= 0)
     }
 }
 
@@ -109,7 +159,11 @@ public data class ReconnectPolicy(
  *
  * Use one supervisor per account per process; [ConnectionRegistry] enforces that.
  *
+ * While online, an idle probe runs on the interval [AdaptiveKeepalive] learned
+ * for the current network, so a dead link is found even when nothing is sent.
+ *
  * @param scope where the actor runs. Cancelling it stops the supervisor and closes the session.
+ * @param keepalive learned idle intervals; null turns idle probing off.
  * @param clock monotonic milliseconds, injectable for tests.
  */
 public class ConnectionSupervisor(
@@ -118,6 +172,7 @@ public class ConnectionSupervisor(
     private val policy: ReconnectPolicy = ReconnectPolicy(),
     private val random: Random = Random.Default,
     private val clock: () -> Long = monotonicMillis(),
+    private val keepalive: AdaptiveKeepalive? = AdaptiveKeepalive(),
 ) {
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.Idle)
     public val state: StateFlow<ConnectionState> = _state.asStateFlow()
@@ -133,6 +188,9 @@ public class ConnectionSupervisor(
         class SessionEnded(val epoch: Long, val cause: Throwable?) : Intent
         class ProbeDone(val epoch: Long, val ok: Boolean) : Intent
         class TimerFired(val token: Long) : Intent
+        class KeepaliveDue(val token: Long) : Intent
+        class Foreground(val foreground: Boolean) : Intent
+        class BackgroundDue(val token: Long) : Intent
     }
 
     // Everything below is touched only by the actor coroutine.
@@ -151,6 +209,12 @@ public class ConnectionSupervisor(
     private var probeJob: Job? = null
     private var timerJob: Job? = null
     private var timerToken = 0L
+    private var keepaliveJob: Job? = null
+    private var keepaliveToken = 0L
+    private var probeIsIdle = false
+    private var foreground = true
+    private var backgroundJob: Job? = null
+    private var backgroundToken = 0L
     private val waiters = ArrayList<CompletableDeferred<ConnectResult>>()
 
     private val actor = scope.launch {
@@ -198,6 +262,15 @@ public class ConnectionSupervisor(
         intents.trySend(Intent.Network(available, id))
     }
 
+    /**
+     * Tells the supervisor whether the app is in the foreground. Coming to the
+     * foreground acts like [wake]; in the background, retries back off further
+     * and probes get more time.
+     */
+    public fun setForeground(foreground: Boolean) {
+        intents.trySend(Intent.Foreground(foreground))
+    }
+
     /** Stops the actor and closes the session. The supervisor cannot be reused. */
     public fun close() {
         intents.close()
@@ -207,13 +280,7 @@ public class ConnectionSupervisor(
     private fun handle(intent: Intent) {
         when (intent) {
             is Intent.Connect -> onConnect(intent.result)
-            is Intent.Disconnect -> {
-                wanted = false
-                stopEverything()
-                set(ConnectionState.Idle)
-                completeWaiters(ConnectResult.Cancelled)
-                intent.done.complete(Unit)
-            }
+            is Intent.Disconnect -> onDisconnect(intent.done)
             Intent.Wake -> if (wanted) onWake()
             is Intent.Network -> onNetwork(intent.available, intent.id)
             is Intent.AttemptDone -> onAttemptDone(intent)
@@ -223,7 +290,104 @@ public class ConnectionSupervisor(
                 timerJob = null
                 startAttempt()
             }
+            is Intent.KeepaliveDue -> if (intent.token == keepaliveToken && session != null) {
+                keepaliveJob = null
+                probe(idle = true)
+            }
+            is Intent.Foreground -> onForeground(intent.foreground)
+            is Intent.BackgroundDue -> if (intent.token == backgroundToken && !foreground && wanted) {
+                backgroundJob = null
+                if (_state.value != ConnectionState.Paused && _state.value !is ConnectionState.Terminal) pause()
+            }
         }
+    }
+
+    private fun onForeground(nowForeground: Boolean) {
+        val was = foreground
+        foreground = nowForeground
+        if (was == nowForeground) return
+        cancelBackgroundTimer()
+        if (!wanted) return
+        if (nowForeground) {
+            when (_state.value) {
+                ConnectionState.Paused -> {
+                    failures = 0
+                    startAttempt() // Resumes the held session when the server still has it.
+                }
+                else -> onWake()
+            }
+            return
+        }
+        if (policy.backgroundMode == BackgroundMode.STAY_CONNECTED) return
+        if (policy.backgroundCloseDelayMillis == 0L) {
+            pause()
+            return
+        }
+        val token = backgroundToken
+        backgroundJob = scope.launch {
+            delay(policy.backgroundCloseDelayMillis)
+            deliver(Intent.BackgroundDue(token))
+        }
+    }
+
+    private fun cancelBackgroundTimer() {
+        backgroundJob?.cancel()
+        backgroundJob = null
+        backgroundToken++
+    }
+
+    /** Closes the connection on purpose for the background, keeping [wanted]. */
+    private fun pause() {
+        when (policy.backgroundMode) {
+            BackgroundMode.CLOSE -> closeSessionGracefully(null)
+            else -> dropSession() // DETACH: an abrupt close leaves the SM session resumable.
+        }
+        cancelAttempt()
+        cancelTimer()
+        set(ConnectionState.Paused)
+    }
+
+    /** In the background with a closing mode, a lost connection waits for the foreground instead of retrying. */
+    private val pausedByBackground: Boolean
+        get() = !foreground && backgroundJob == null && policy.backgroundMode != BackgroundMode.STAY_CONNECTED
+
+    private fun onDisconnect(done: CompletableDeferred<Unit>) {
+        wanted = false
+        closeSessionGracefully(done)
+        stopEverything()
+        set(ConnectionState.Idle)
+        completeWaiters(ConnectResult.Cancelled)
+    }
+
+    /**
+     * Detaches the live session and ends it politely in the background. A new
+     * attempt waits for this, so the old session is gone before a new one opens.
+     */
+    private fun closeSessionGracefully(done: CompletableDeferred<Unit>?) {
+        val closing = session
+        val closingWatch = watchJob
+        // Detach the session so dropSession does not cut it; it is closed politely below.
+        session = null
+        watchJob = null
+        dropSession()
+        if (closing == null) {
+            done?.complete(Unit)
+            return
+        }
+        val job = scope.launch {
+            try {
+                withTimeoutOrNull(policy.gracefulCloseMillis) { closing.closeGracefully() }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                // Closing anyway below.
+            } finally {
+                closing.close()
+                closingWatch?.cancel()
+                done?.complete(Unit)
+            }
+        }
+        draining += job
     }
 
     private fun onConnect(result: CompletableDeferred<ConnectResult>) {
@@ -234,7 +398,8 @@ public class ConnectionSupervisor(
                 probe()
             }
             is ConnectionState.Connecting, ConnectionState.WaitingForNetwork -> waiters += result
-            is ConnectionState.Backoff, ConnectionState.Idle, is ConnectionState.Terminal -> {
+            // An explicit connect() works in the background too, for example to handle a push.
+            is ConnectionState.Backoff, ConnectionState.Idle, ConnectionState.Paused, is ConnectionState.Terminal -> {
                 waiters += result
                 failures = 0
                 cancelTimer()
@@ -289,7 +454,7 @@ public class ConnectionSupervisor(
                 failures = 0
                 startAttempt()
             }
-            ConnectionState.Idle, is ConnectionState.Terminal -> Unit
+            ConnectionState.Idle, ConnectionState.Paused, is ConnectionState.Terminal -> Unit
         }
     }
 
@@ -332,6 +497,7 @@ public class ConnectionSupervisor(
             onlineSince = clock()
             set(ConnectionState.Online(opened.jid))
             completeWaiters(ConnectResult.Connected(opened.jid))
+            scheduleKeepalive()
             val myEpoch = epoch
             watchJob = scope.launch {
                 val cause = try {
@@ -359,6 +525,7 @@ public class ConnectionSupervisor(
         dropSession()
         when {
             cause != null && isTerminal(cause) -> stopTerminal(cause)
+            pausedByBackground -> set(ConnectionState.Paused)
             livedMillis < policy.stableSessionMillis -> {
                 failures++
                 scheduleRetry(cause)
@@ -372,19 +539,30 @@ public class ConnectionSupervisor(
 
     private fun onProbeDone(ok: Boolean) {
         probeJob = null
-        if (ok) return
+        val idle = probeIsIdle
+        probeIsIdle = false
+        if (ok) {
+            if (idle) keepalive?.onIdleSuccess(networkId)
+            scheduleKeepalive() // Any answered probe proves the link; restart the idle clock.
+            return
+        }
+        // A link that dies while idle tells us this network's NAT forgets us sooner.
+        if (idle) keepalive?.onIdleDeath(networkId)
         dropSession()
         failures = 0
-        startAttempt() // Waits for the network instead if there is none.
+        if (pausedByBackground) set(ConnectionState.Paused) else startAttempt() // Waits for the network if there is none.
     }
 
-    private fun probe() {
+    private fun probe(idle: Boolean = false) {
         val live = session ?: return
         if (probeJob != null) return // One probe at a time; its result answers every trigger.
+        probeIsIdle = idle
+        cancelKeepalive()
         val myEpoch = epoch
+        val timeout = if (foreground) policy.probeTimeoutMillis else policy.backgroundProbeTimeoutMillis
         probeJob = scope.launch {
             val ok = try {
-                withTimeoutOrNull(policy.probeTimeoutMillis) { live.probe() } ?: false
+                withTimeoutOrNull(timeout) { live.probe() } ?: false
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
@@ -409,10 +587,29 @@ public class ConnectionSupervisor(
         }
     }
 
+    private fun scheduleKeepalive() {
+        val ka = keepalive ?: return
+        if (session == null) return
+        cancelKeepalive()
+        val token = keepaliveToken
+        val interval = ka.intervalFor(networkId)
+        keepaliveJob = scope.launch {
+            delay(interval)
+            deliver(Intent.KeepaliveDue(token))
+        }
+    }
+
+    private fun cancelKeepalive() {
+        keepaliveJob?.cancel()
+        keepaliveJob = null
+        keepaliveToken++
+    }
+
     /** Full jitter: random in [0, min(cap, base·2^(n-2))]. */
     internal fun backoffDelay(failures: Int): Long {
         val exponent = (failures - 2).coerceIn(0, 30)
-        val ceiling = minOf(policy.maxDelayMillis, policy.baseDelayMillis shl exponent).coerceAtLeast(1)
+        val cap = if (foreground) policy.maxDelayMillis else policy.backgroundMaxDelayMillis
+        val ceiling = minOf(cap, policy.baseDelayMillis shl exponent).coerceAtLeast(1)
         return random.nextLong(ceiling + 1).coerceAtLeast(1)
     }
 
@@ -427,6 +624,8 @@ public class ConnectionSupervisor(
         watchJob = null
         probeJob?.cancel()
         probeJob = null
+        probeIsIdle = false
+        cancelKeepalive()
         session?.close()
         session = null
         epoch++ // Anything still in flight for the old session is now stale.
@@ -456,6 +655,8 @@ public class ConnectionSupervisor(
     private fun shutdown() {
         attemptJob?.cancel()
         timerJob?.cancel()
+        keepaliveJob?.cancel()
+        backgroundJob?.cancel()
         watchJob?.cancel()
         probeJob?.cancel()
         session?.close()

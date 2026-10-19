@@ -89,6 +89,8 @@ internal class FakeXmppServer(
     val clientAcks = LinkedBlockingQueue<Long>()
     @Volatile var connections = 0
     @Volatile var resumes = 0
+    @Volatile var clientClosedStream = false
+    @Volatile private var smSessionEnded = false
 
     // Server-side SM state; survives a dropped connection, as on a real server.
     @Volatile private var smInbound = 0L
@@ -216,16 +218,25 @@ internal class FakeXmppServer(
         c.send("<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>$session$sm<csi xmlns='urn:xmpp:csi:0'/></stream:features>")
         var smOn = false
         while (true) {
-            val el = (c.next() as? Element) ?: return
+            val event = c.next()
+            if (event == "closed") {
+                // A clean close ends the session for good: it can no longer be resumed.
+                clientClosedStream = true
+                smSessionEnded = true
+                c.send("</stream:stream>")
+                return
+            }
+            val el = (event as? Element) ?: return
             val id = el.attribute("id")
             if (el.namespace == "urn:xmpp:sm:3") {
                 when (el.name) {
                     "enable" -> {
                         smOn = true
+                        smSessionEnded = false
                         smInbound = 0
                         c.send("<enabled xmlns='urn:xmpp:sm:3' id='$smId' resume='true' max='300'/>")
                     }
-                    "resume" -> if (allowResume && el.attribute("previd") == smId) {
+                    "resume" -> if (allowResume && !smSessionEnded && el.attribute("previd") == smId) {
                         smInbound -= lostInTransit
                         smOn = true
                         resumes++

@@ -15,6 +15,7 @@ import kotlinx.coroutines.test.runTest
 import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 import kotlin.test.fail
@@ -38,6 +39,9 @@ internal class FakeServer(private val scope: CoroutineScope) {
     var maxProbesInFlight = 0
     /** Set by the test around disconnect() calls. */
     var disconnecting = false
+    /** Set by the test while the app is in the background, where closing on purpose is allowed. */
+    var backgrounded = false
+    var probes = 0
 
     inner class FakeSession(val index: Int) : LiveSession {
         override val jid = FullJid.parse("juliet@example.com/res$index")
@@ -46,6 +50,7 @@ internal class FakeServer(private val scope: CoroutineScope) {
         var closedByServer = false
         var probeFailed = false
         var closedDuringDisconnect = false
+        var closedGracefully = false
         /** Set when the supervisor reported this session as Online. */
         var wasOnline = false
 
@@ -53,6 +58,7 @@ internal class FakeServer(private val scope: CoroutineScope) {
 
         override suspend fun probe(): Boolean {
             var ok = false
+            probes++
             probesInFlight++
             maxProbesInFlight = maxOf(maxProbesInFlight, probesInFlight)
             try {
@@ -65,8 +71,13 @@ internal class FakeServer(private val scope: CoroutineScope) {
             }
         }
 
+        override suspend fun closeGracefully() {
+            if (!closed) closedGracefully = true
+            close()
+        }
+
         override fun close() {
-            if (!closed) closedDuringDisconnect = disconnecting
+            if (!closed) closedDuringDisconnect = disconnecting || backgrounded
             closed = true
             ended.complete(null)
         }
@@ -100,8 +111,12 @@ private fun lost() = XmppNegotiationException(NegotiationFailure.CONNECTION_LOST
 private fun badPassword() = XmppNegotiationException(NegotiationFailure.AUTHENTICATION, "not-authorized")
 private fun conflict() = XmppNegotiationException(NegotiationFailure.STREAM_ERROR, "conflict", streamError = "conflict")
 
-private fun TestScope.supervisor(server: FakeServer, seed: Int = 1, policy: ReconnectPolicy = ReconnectPolicy()) =
-    ConnectionSupervisor(backgroundScope, server.opener, policy, Random(seed)) { testScheduler.currentTime }
+private fun TestScope.supervisor(
+    server: FakeServer,
+    seed: Int = 1,
+    policy: ReconnectPolicy = ReconnectPolicy(),
+    keepalive: AdaptiveKeepalive? = null,
+) = ConnectionSupervisor(backgroundScope, server.opener, policy, Random(seed), { testScheduler.currentTime }, keepalive)
 
 /**
  * The supervisor runs in backgroundScope, which advanceUntilIdle does not wait
@@ -350,6 +365,121 @@ class ConnectionSupervisorTest {
         assertTrue(all.all { it === all[0] })
     }
 
+    @Test
+    fun idleKeepaliveProbesAndLearnsALongerInterval() = runTest {
+        val server = FakeServer(backgroundScope)
+        val keepalive = AdaptiveKeepalive(KeepalivePolicy(initialMillis = 60_000, stepMillis = 30_000, successesToGrow = 3))
+        val sup = supervisor(server, keepalive = keepalive)
+        sup.networkChanged(true, "home-wifi")
+        sup.connect()
+        settle(59_000)
+        assertEquals(0, server.probes)
+        settle(2_000)
+        assertEquals(1, server.probes)
+        settle(3 * 60_000)
+        assertEquals(90_000, keepalive.intervalFor("home-wifi"))
+        assertEquals(1, server.opensStarted)
+    }
+
+    @Test
+    fun aLinkThatDiesWhileIdleShortensTheInterval() = runTest {
+        val server = FakeServer(backgroundScope)
+        val keepalive = AdaptiveKeepalive(KeepalivePolicy(initialMillis = 90_000, minMillis = 30_000, stepMillis = 30_000))
+        val sup = supervisor(server, keepalive = keepalive)
+        sup.networkChanged(true, "carrier-a")
+        sup.connect()
+        server.probeAnswers = { false }
+        settle(100_000)
+        assertEquals(60_000, keepalive.intervalFor("carrier-a"))
+        assertEquals(90_000, keepalive.intervalFor("other-network"), "learned per network")
+        assertEquals(2, server.opensStarted, "the dead link was replaced")
+    }
+
+    @Test
+    fun backgroundClosesCleanlyAfterTheDelayAndForegroundReconnects() = runTest {
+        val server = FakeServer(backgroundScope)
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 5_000))
+        sup.connect()
+        sup.setForeground(false)
+        settle(4_000)
+        assertIs<ConnectionState.Online>(sup.state.value, "still within the 5 s grace")
+        settle(2_000)
+        assertEquals(ConnectionState.Paused, sup.state.value)
+        assertTrue(server.sessions[0].closedGracefully, "CLOSE ends the stream politely")
+        // Nothing reconnects in the background, whatever happens.
+        sup.wake()
+        sup.networkChanged(true, "other")
+        settle(30 * 60_000)
+        assertEquals(1, server.opensStarted)
+
+        sup.setForeground(true)
+        settle(1_000)
+        assertIs<ConnectionState.Online>(sup.state.value)
+        assertEquals(2, server.opensStarted)
+    }
+
+    @Test
+    fun aQuickTripToTheBackgroundKeepsTheConnection() = runTest {
+        val server = FakeServer(backgroundScope)
+        val sup = supervisor(server)
+        sup.connect()
+        sup.setForeground(false)
+        settle(2_000)
+        sup.setForeground(true)
+        settle(60_000)
+        assertIs<ConnectionState.Online>(sup.state.value)
+        assertEquals(1, server.opensStarted)
+        assertTrue(server.live.size == 1)
+    }
+
+    @Test
+    fun detachModeCutsTheSocketWithoutEndingTheStream() = runTest {
+        val server = FakeServer(backgroundScope)
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundMode = BackgroundMode.DETACH, backgroundCloseDelayMillis = 0))
+        sup.connect()
+        sup.setForeground(false)
+        settle(1_000)
+        assertEquals(ConnectionState.Paused, sup.state.value)
+        assertTrue(server.sessions[0].closed)
+        assertFalse(server.sessions[0].closedGracefully, "DETACH leaves the server session resumable")
+    }
+
+    @Test
+    fun stayConnectedModeIgnoresTheBackground() = runTest {
+        val server = FakeServer(backgroundScope)
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundMode = BackgroundMode.STAY_CONNECTED))
+        sup.connect()
+        sup.setForeground(false)
+        settle(60_000)
+        assertIs<ConnectionState.Online>(sup.state.value)
+    }
+
+    @Test
+    fun connectWorksWhilePausedForHandlingAPush() = runTest {
+        val server = FakeServer(backgroundScope)
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 0))
+        sup.connect()
+        sup.setForeground(false)
+        settle(1_000)
+        assertEquals(ConnectionState.Paused, sup.state.value)
+        assertIs<ConnectResult.Connected>(sup.connect())
+        // If that connection drops while still in the background, it waits for the foreground.
+        server.sessions.last().drop(lost())
+        settle(60_000)
+        assertEquals(ConnectionState.Paused, sup.state.value)
+        assertEquals(2, server.opensStarted)
+    }
+
+    @Test
+    fun disconnectEndsTheStreamPolitely() = runTest {
+        val server = FakeServer(backgroundScope)
+        val sup = supervisor(server)
+        sup.connect()
+        sup.disconnect()
+        assertTrue(server.sessions[0].closedGracefully)
+        assertEquals(0, server.live.size)
+    }
+
     /**
      * Design §4.1a rule 9: random interleavings of every trigger, with a
      * randomly unreliable server, under virtual time. Invariants checked:
@@ -376,9 +506,12 @@ class ConnectionSupervisorTest {
         }
         server.probeAnswers = { rnd.nextInt(4) != 0 }
         server.probeDelayMillis = rnd.nextLong(1, 15_000)
+        val mode = BackgroundMode.entries[seed % BackgroundMode.entries.size]
         val sup = ConnectionSupervisor(
-            backgroundScope, server.opener, ReconnectPolicy(probeTimeoutMillis = 5_000), Random(seed),
-        ) { testScheduler.currentTime }
+            backgroundScope, server.opener,
+            ReconnectPolicy(probeTimeoutMillis = 5_000, backgroundMode = mode, backgroundCloseDelayMillis = rnd.nextLong(0, 6_000)),
+            Random(seed), { testScheduler.currentTime }, AdaptiveKeepalive(),
+        )
 
         backgroundScope.launch {
             sup.state.collect { s ->
@@ -399,6 +532,11 @@ class ConnectionSupervisorTest {
                     sup.disconnect()
                     server.disconnecting = false
                 }
+                6 -> if (rnd.nextInt(3) == 0) {
+                    val fg = rnd.nextBoolean()
+                    server.backgrounded = !fg
+                    sup.setForeground(fg)
+                }
                 else -> Unit
             }
             advanceTimeBy(rnd.nextLong(0, 4_000))
@@ -409,7 +547,11 @@ class ConnectionSupervisorTest {
         // Settle: a reliable server and network must bring every caller to an answer.
         server.nextFailure = { null }
         server.probeAnswers = { true }
+        server.probeDelayMillis = 10 // Answers within the probe timeout from now on.
+        sup.setForeground(true)
         sup.networkChanged(true, "final")
+        settle(1_000)
+        server.backgrounded = false
         callers += async { sup.connect() }
         advanceTimeBy(30 * 60_000)
         runCurrent()
