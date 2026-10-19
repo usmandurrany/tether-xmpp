@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Debug builds may upload logs to a log portal over plain http on your LAN.
+         XMPP itself always uses TLS; this only affects the log portal. -->
+    <application android:networkSecurityConfig="@xml/network_security_config" />
+</manifest>

@@ -1,0 +1,36 @@
+# Temporary: builds the Android demo app (tether-demo-android) against this
+# branch of the SDK. The demo's files are copied under .verify/ because CI here
+# cannot read the private demo repository.
+name: Verify Android demo
+
+on:
+  push:
+    branches: [claude/project-thread-3xm00v]
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Lay out the demo with the SDK as its submodule
+        run: |
+          demo="$RUNNER_TEMP/tether-demo-android"
+          cp -r .verify/tether-demo-android "$demo"
+          mkdir "$demo/tether-xmpp"
+          rsync -a --exclude .verify --exclude .git ./ "$demo/tether-xmpp/"
+          echo "DEMO=$demo" >> "$GITHUB_ENV"
+      - name: Build the debug APK
+        run: cd "$DEMO" && ./gradlew assembleDebug lintDebug --stacktrace
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tether-demo-debug
+          path: |
+            ${{ env.DEMO }}/app/build/outputs/apk/debug/*.apk
+            ${{ env.DEMO }}/app/build/reports/lint-results-debug.html

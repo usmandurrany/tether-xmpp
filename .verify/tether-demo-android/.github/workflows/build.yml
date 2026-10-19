@@ -1,0 +1,52 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # tether-xmpp is private for now. Give CI read access with a fine-grained
+      # token (Contents: read on usmandurrany/tether-xmpp) saved as the
+      # TETHER_SDK_TOKEN secret. Without it the build is skipped with a warning.
+      - name: Fetch the SDK submodule
+        id: sdk
+        env:
+          TOKEN: ${{ secrets.TETHER_SDK_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+          fi
+          if git submodule update --init; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Could not fetch the tether-xmpp submodule. Add a TETHER_SDK_TOKEN secret (see README)."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.sdk.outputs.ok == 'true'
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.sdk.outputs.ok == 'true'
+
+      - name: Build the debug APK
+        if: steps.sdk.outputs.ok == 'true'
+        run: ./gradlew assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        if: steps.sdk.outputs.ok == 'true'
+        with:
+          name: tether-demo-debug-apk
+          path: app/build/outputs/apk/debug/*.apk

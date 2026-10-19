@@ -1,0 +1,29 @@
+[versions]
+# Keep agp and kotlin equal to the SDK's (tether-xmpp/gradle/libs.versions.toml).
+agp = "8.13.0"
+kotlin = "2.4.20"
+tether = "0.1.0-SNAPSHOT"
+compose-bom = "2025.05.00"
+activity-compose = "1.10.1"
+lifecycle = "2.8.7"
+coroutines = "1.11.0"
+
+[libraries]
+tether-android = { module = "io.github.usmandurrany.tether:tether-android", version.ref = "tether" }
+tether-im = { module = "io.github.usmandurrany.tether:tether-im", version.ref = "tether" }
+tether-debug = { module = "io.github.usmandurrany.tether:tether-debug", version.ref = "tether" }
+
+compose-bom = { module = "androidx.compose:compose-bom", version.ref = "compose-bom" }
+compose-material3 = { module = "androidx.compose.material3:material3" }
+compose-ui = { module = "androidx.compose.ui:ui" }
+compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
+compose-ui-tooling = { module = "androidx.compose.ui:ui-tooling" }
+activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activity-compose" }
+lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycle" }
+lifecycle-process = { module = "androidx.lifecycle:lifecycle-process", version.ref = "lifecycle" }
+kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }

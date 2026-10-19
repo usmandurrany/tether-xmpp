@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Only the window; everything on screen is Compose with Material 3. -->
+    <style name="Theme.TetherDemo" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
