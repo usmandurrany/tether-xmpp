@@ -28,7 +28,9 @@ public class EndpointResolver(
         if (all.all { it.first.target == "." || it.first.target.isEmpty() }) return emptyList()
 
         val result = ArrayList<Endpoint>()
-        for ((_, group) in all.filter { it.first.target != "." }.groupBy { it.first.priority }.toSortedMap()) {
+        val byPriority = all.filter { it.first.target != "." }.groupBy { it.first.priority }
+        for (priority in byPriority.keys.sorted()) {
+            val group = byPriority.getValue(priority)
             // Direct TLS first within a priority, each family weighted-shuffled.
             for (family in listOf(true, false)) {
                 weightedOrder(group.filter { it.second == family }.map { it.first })
