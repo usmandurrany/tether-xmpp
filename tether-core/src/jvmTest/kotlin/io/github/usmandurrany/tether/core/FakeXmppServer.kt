@@ -84,6 +84,9 @@ internal class FakeXmppServer(
     /** Serve TLS through Conscrypt and offer `tls-exporter` channel binding. */
     val conscrypt: Boolean = false,
 ) : AutoCloseable {
+    /** Sent just before the answer to an IQ addressed to the account, like archive results before `<fin/>`. */
+    @Volatile var beforeAccountAnswer: List<String> = emptyList()
+
     private val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
     val port: Int get() = server.localPort
     val failures = LinkedBlockingQueue<Throwable>()
@@ -276,11 +279,13 @@ internal class FakeXmppServer(
                             "<feature var='urn:xmpp:ping'/></query></iq>",
                     )
                 }
-                el.name == "iq" && el.attribute("to") == "juliet@localhost" ->
+                el.name == "iq" && el.attribute("to") == "juliet@localhost" -> {
+                    beforeAccountAnswer.forEach { c.send(it) }
                     c.send(
                         "<iq type='error' id='$id' from='juliet@localhost'><error type='cancel'>" +
                             "<service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
                     )
+                }
                 el.name == "iq" && el.attribute("type") == "result" -> fromClient += el
                 else -> fromClient += el
             }
