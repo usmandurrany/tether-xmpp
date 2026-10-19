@@ -49,6 +49,21 @@ public fun interface SessionOpener {
     public suspend fun open(): LiveSession
 }
 
+/**
+ * The OS signals a connection reacts to. Platform glue (such as the Android
+ * module) feeds these from the app lifecycle and the network monitor.
+ */
+public interface ConnectionControls {
+    /** See [ConnectionSupervisor.setForeground]. */
+    public fun setForeground(foreground: Boolean)
+
+    /** See [ConnectionSupervisor.networkChanged]. */
+    public fun networkChanged(available: Boolean, id: String? = null, kind: String? = id)
+
+    /** See [ConnectionSupervisor.wake]. */
+    public fun wake()
+}
+
 /** What the connection is doing. Observe [ConnectionSupervisor.state]. */
 public sealed interface ConnectionState {
     /** Not wanted: [ConnectionSupervisor.connect] has not been called, or [ConnectionSupervisor.disconnect] was. */
@@ -173,7 +188,7 @@ public class ConnectionSupervisor(
     private val random: Random = Random.Default,
     private val clock: () -> Long = monotonicMillis(),
     private val keepalive: AdaptiveKeepalive? = AdaptiveKeepalive(),
-) {
+) : ConnectionControls {
     private val _state = MutableStateFlow<ConnectionState>(ConnectionState.Idle)
     public val state: StateFlow<ConnectionState> = _state.asStateFlow()
 
@@ -183,7 +198,7 @@ public class ConnectionSupervisor(
         class Connect(val result: CompletableDeferred<ConnectResult>) : Intent
         class Disconnect(val done: CompletableDeferred<Unit>) : Intent
         data object Wake : Intent
-        class Network(val available: Boolean, val id: String?) : Intent
+        class Network(val available: Boolean, val id: String?, val kind: String?) : Intent
         class AttemptDone(val epoch: Long, val session: LiveSession?, val error: Throwable?) : Intent
         class SessionEnded(val epoch: Long, val cause: Throwable?) : Intent
         class ProbeDone(val epoch: Long, val ok: Boolean) : Intent
@@ -199,6 +214,7 @@ public class ConnectionSupervisor(
     private var failures = 0
     private var networkAvailable = true
     private var networkId: String? = null
+    private var networkKind: String? = null
     private var attemptNetworkId: String? = null
     private var attemptJob: Job? = null
     /** Cancelled attempts that have not finished yet (a blocking connect may ignore cancellation). */
@@ -249,7 +265,7 @@ public class ConnectionSupervisor(
      * foreground, or a push arrived. Probes a live session, or skips the
      * backoff wait. Ignored unless [connect] was called.
      */
-    public fun wake() {
+    override fun wake() {
         intents.trySend(Intent.Wake)
     }
 
@@ -257,9 +273,13 @@ public class ConnectionSupervisor(
      * Reports the validated default network. [id] identifies the network (for
      * example the Android `Network` handle); a change of id means a network switch.
      * Callers should debounce bursts of OS callbacks before calling this.
+     *
+     * [kind] is what keepalive timing is learned for, such as "wifi" or
+     * "cell:310260". It should stay the same when the same kind of network comes
+     * back, whereas [id] changes on every reconnect. Defaults to [id].
      */
-    public fun networkChanged(available: Boolean, id: String? = null) {
-        intents.trySend(Intent.Network(available, id))
+    override fun networkChanged(available: Boolean, id: String?, kind: String?) {
+        intents.trySend(Intent.Network(available, id, kind))
     }
 
     /**
@@ -267,7 +287,7 @@ public class ConnectionSupervisor(
      * foreground acts like [wake]; in the background, retries back off further
      * and probes get more time.
      */
-    public fun setForeground(foreground: Boolean) {
+    override fun setForeground(foreground: Boolean) {
         intents.trySend(Intent.Foreground(foreground))
     }
 
@@ -282,7 +302,10 @@ public class ConnectionSupervisor(
             is Intent.Connect -> onConnect(intent.result)
             is Intent.Disconnect -> onDisconnect(intent.done)
             Intent.Wake -> if (wanted) onWake()
-            is Intent.Network -> onNetwork(intent.available, intent.id)
+            is Intent.Network -> {
+                networkKind = if (intent.available) intent.kind else null
+                onNetwork(intent.available, intent.id)
+            }
             is Intent.AttemptDone -> onAttemptDone(intent)
             is Intent.SessionEnded -> if (intent.epoch == epoch && session != null) onSessionEnded(intent.cause)
             is Intent.ProbeDone -> if (intent.epoch == epoch && session != null) onProbeDone(intent.ok)
@@ -542,12 +565,12 @@ public class ConnectionSupervisor(
         val idle = probeIsIdle
         probeIsIdle = false
         if (ok) {
-            if (idle) keepalive?.onIdleSuccess(networkId)
+            if (idle) keepalive?.onIdleSuccess(networkKind)
             scheduleKeepalive() // Any answered probe proves the link; restart the idle clock.
             return
         }
         // A link that dies while idle tells us this network's NAT forgets us sooner.
-        if (idle) keepalive?.onIdleDeath(networkId)
+        if (idle) keepalive?.onIdleDeath(networkKind)
         dropSession()
         failures = 0
         if (pausedByBackground) set(ConnectionState.Paused) else startAttempt() // Waits for the network if there is none.
@@ -592,7 +615,7 @@ public class ConnectionSupervisor(
         if (session == null) return
         cancelKeepalive()
         val token = keepaliveToken
-        val interval = ka.intervalFor(networkId)
+        val interval = ka.intervalFor(networkKind)
         keepaliveJob = scope.launch {
             delay(interval)
             deliver(Intent.KeepaliveDue(token))
