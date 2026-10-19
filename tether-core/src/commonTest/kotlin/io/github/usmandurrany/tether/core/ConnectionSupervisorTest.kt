@@ -382,6 +382,19 @@ class ConnectionSupervisorTest {
     }
 
     @Test
+    fun keepaliveIsLearnedPerKindOfNetworkNotPerConnection() = runTest {
+        val server = FakeServer(backgroundScope)
+        val keepalive = AdaptiveKeepalive(KeepalivePolicy(initialMillis = 90_000, minMillis = 30_000, stepMillis = 30_000))
+        val sup = supervisor(server, keepalive = keepalive)
+        sup.networkChanged(true, id = "net-101", kind = "wifi")
+        sup.connect()
+        server.probeAnswers = { false }
+        settle(100_000)
+        assertEquals(60_000, keepalive.intervalFor("wifi"))
+        assertEquals(90_000, keepalive.intervalFor("net-101"), "the connection id is not the learning key")
+    }
+
+    @Test
     fun aLinkThatDiesWhileIdleShortensTheInterval() = runTest {
         val server = FakeServer(backgroundScope)
         val keepalive = AdaptiveKeepalive(KeepalivePolicy(initialMillis = 90_000, minMillis = 30_000, stepMillis = 30_000))
