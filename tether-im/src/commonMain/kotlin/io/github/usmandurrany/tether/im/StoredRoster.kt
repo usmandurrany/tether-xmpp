@@ -30,6 +30,11 @@ public class StoredRoster(private val store: KeyValueStore, account: BareJid) : 
         }.getOrNull() // unreadable: fetch the whole roster again
     }
 
+    /** Forgets the saved roster, for example on sign-out. */
+    public suspend fun clear() {
+        store.put(key, null)
+    }
+
     override suspend fun save(snapshot: RosterSnapshot) {
         val query = element("query", ImNs.ROSTER) {
             attribute("ver", snapshot.version)

@@ -6,7 +6,14 @@ Targets: **Android (API 26+)** and the **JVM**, which covers every desktop (Linu
 
 Status: early development. See [docs/design.md](docs/design.md) for the architecture and roadmap.
 
-To add Tether to an app, see [docs/integration.md](docs/integration.md).
+To add Tether to an app, see [docs/integration.md](docs/integration.md). The short version:
+
+```kotlin
+val chat = TetherAndroid.chat(context, BareJid.parse("alice@example.com"), password)  // or TetherJvm.chat(...)
+chat.connect()
+chat.conversations.collect { render(it) }   // chat list with unread counts and typing
+chat.send(bob, "Hi Bob")                    // ticks, read receipts, offline queue: handled
+```
 
 ## Probing a server
 

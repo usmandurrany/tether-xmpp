@@ -66,6 +66,9 @@ public class CredentialVault(private val store: KeyValueStore) {
         }.getOrDefault(emptyList())
     }
 
+    /** True when an earlier login saved keys for [account], so it can log in without the password. */
+    public suspend fun hasKeys(account: BareJid): Boolean = loadKeys(account).isNotEmpty()
+
     /** Forgets the account's secrets, for example on logout. */
     public suspend fun clear(account: BareJid) {
         store.put(keyFor(account), null)

@@ -35,3 +35,41 @@ public class XmppConfig(
 
     override fun toString(): String = "XmppConfig(jid=$jid, host=$host, port=$port, password=${if (password != null) "***" else "none"})"
 }
+
+/**
+ * How to reach the server, for the ready-made `chat(...)` builders. All
+ * optional: by default the server is found through DNS SRV records with
+ * STARTTLS and SCRAM login.
+ */
+public data class ConnectionOptions(
+    /** Null lets the server assign a resource. */
+    val resource: String? = null,
+    /** Skips DNS SRV and connects here. */
+    val host: String? = null,
+    val port: Int? = null,
+    /** With [host]: TLS from the first byte instead of STARTTLS. */
+    val directTls: Boolean = false,
+    val tls: TlsConfig = TlsConfig(),
+    val sasl: SaslConfig = SaslConfig(),
+) {
+    /**
+     * The config for [jid]: logs in with [password] when given, otherwise with
+     * the SCRAM keys an earlier login saved in [vault]. Throws
+     * [IllegalArgumentException] when there is neither.
+     */
+    public suspend fun configFor(jid: BareJid, password: String?, vault: CredentialVault): XmppConfig {
+        val keys = if (password.isNullOrEmpty()) vault.loadKeys(jid) else emptyList()
+        require(!password.isNullOrEmpty() || keys.isNotEmpty()) { "No saved login for $jid: sign in with the password" }
+        return XmppConfig(
+            jid = jid,
+            password = password?.ifEmpty { null },
+            scramKeys = keys,
+            resource = resource,
+            host = host,
+            port = port,
+            directTls = directTls,
+            tls = tls,
+            sasl = sasl,
+        )
+    }
+}

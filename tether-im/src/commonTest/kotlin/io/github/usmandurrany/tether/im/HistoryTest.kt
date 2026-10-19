@@ -63,4 +63,33 @@ class HistoryTest {
         assertEquals(false, history.available.value)
         assertEquals("feature-not-implemented", assertFailsWith<XmppStanzaException> { history.fetch() }.condition)
     }
+
+    @Test
+    fun archivedReceiptsAndMarkersComeWithThePage() = runTest {
+        lateinit var history: History
+        val sender = FakeSender()
+        history = History(sender)
+        sender.answer = { iq ->
+            val qid = iq.child("query", ImNs.MAM)!!.attribute("queryid")
+            listOf(
+                "<message xmlns='jabber:client' from='romeo@example.net/o' to='juliet@example.com/phone' type='chat'><displayed xmlns='urn:xmpp:chat-markers:0' id='mine-1'/></message>",
+                "<message xmlns='jabber:client' from='romeo@example.net/o' to='juliet@example.com/phone'><received xmlns='urn:xmpp:receipts' id='mine-2'/></message>",
+                "<message xmlns='jabber:client' from='juliet@example.com/laptop' to='romeo@example.net' type='chat'><displayed xmlns='urn:xmpp:chat-markers:0' id='theirs-1'/></message>",
+            ).forEachIndexed { i, inner ->
+                history.onStanza(xml("<message from='juliet@example.com'><result xmlns='urn:xmpp:mam:2' queryid='$qid' id='m$i'><forwarded xmlns='urn:xmpp:forward:0'>$inner</forwarded></result></message>"))
+            }
+            xml("<iq type='result' id='${iq.attribute("id")}'><fin xmlns='urn:xmpp:mam:2' complete='true'/></iq>")
+        }
+        history.onSessionStarted(FakeSession(sender, accountFeatures = setOf(ImNs.MAM)))
+        val page = history.fetch(with = romeo)
+        assertTrue(page.messages.isEmpty())
+        assertEquals(
+            listOf(
+                ArchivedMarker(romeo, "mine-1", displayed = true, outgoing = false),
+                ArchivedMarker(romeo, "mine-2", displayed = false, outgoing = false),
+                ArchivedMarker(romeo, "theirs-1", displayed = true, outgoing = true),
+            ),
+            page.markers,
+        )
+    }
 }

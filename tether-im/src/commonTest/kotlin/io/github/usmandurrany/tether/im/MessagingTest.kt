@@ -134,4 +134,71 @@ class MessagingTest {
         assertNotNull(sender.requests.single().child("enable", ImNs.CARBONS))
         assertTrue(carbons.enabled.value)
     }
+
+    @Test
+    fun sentMessagesAreMarkableAndMarkersBecomeEvents() = runTest {
+        val sender = FakeSender()
+        val messaging = started(sender)
+        messaging.send(romeo, "hi")
+        assertNotNull(sender.sent.single().child("markable", ImNs.MARKERS))
+
+        val events = async { messaging.events.take(3).toList() }
+        yield()
+        // A marker can share a body-less message with a typing state.
+        assertTrue(messaging.onStanza(xml("<message from='romeo@example.net/o' type='chat'><displayed xmlns='urn:xmpp:chat-markers:0' id='m1'/><active xmlns='http://jabber.org/protocol/chatstates'/></message>")))
+        messaging.onStanza(xml("<message from='romeo@example.net/o' type='chat'><received xmlns='urn:xmpp:chat-markers:0' id='m2'/></message>"))
+        assertEquals(
+            listOf(
+                MessageEvent.Displayed(romeo, "m1"),
+                MessageEvent.ChatStateChanged(romeo, ChatState.ACTIVE),
+                MessageEvent.Delivered(romeo, "m2"),
+            ),
+            events.await(),
+        )
+    }
+
+    @Test
+    fun ourMarkerFromAnotherDeviceMeansWeReadIt() = runTest {
+        val messaging = started()
+        val event = async { messaging.events.first() }
+        yield()
+        messaging.onStanza(
+            xml(
+                "<message from='juliet@example.com' to='juliet@example.com/phone'><sent xmlns='urn:xmpp:carbons:2'>" +
+                    "<forwarded xmlns='urn:xmpp:forward:0'><message xmlns='jabber:client' from='juliet@example.com/laptop' to='romeo@example.net' type='chat'><displayed xmlns='urn:xmpp:chat-markers:0' id='r1'/></message></forwarded></sent></message>",
+            ),
+        )
+        assertEquals(MessageEvent.DisplayedElsewhere(romeo, "r1"), event.await())
+    }
+
+    @Test
+    fun markDisplayedSendsAStoredMarker() = runTest {
+        val sender = FakeSender()
+        val messaging = started(sender)
+        messaging.markDisplayed(romeo, "r1")
+        val m = sender.sent.single()
+        assertEquals("r1", m.child("displayed", ImNs.MARKERS)?.attribute("id"))
+        assertNotNull(m.child("store", ImNs.HINTS))
+        assertEquals(null, m.child("body", ImNs.CLIENT))
+    }
+
+    @Test
+    fun incomingMarkableIsReported() = runTest {
+        val messaging = started()
+        val event = async { messaging.events.first() }
+        yield()
+        messaging.onStanza(xml("<message from='romeo@example.net/o' type='chat' id='r1'><body>hi</body><markable xmlns='urn:xmpp:chat-markers:0'/></message>"))
+        assertTrue(assertIs<MessageEvent.Received>(event.await()).message.markable)
+    }
+
+    @Test
+    fun featuresCanLeaveOutReceiptsMarkersAndStates() = runTest {
+        val sender = FakeSender()
+        val messaging = Messaging(sender, requestReceipts = false, markable = false, chatStates = false)
+        messaging.send(romeo, "plain")
+        val m = sender.sent.single()
+        assertEquals(null, m.child("request", ImNs.RECEIPTS))
+        assertEquals(null, m.child("markable", ImNs.MARKERS))
+        assertEquals(null, m.child("active", ImNs.CHAT_STATES))
+    }
 }

@@ -1,0 +1,53 @@
+package io.github.usmandurrany.tether.im
+
+import io.github.usmandurrany.tether.core.BareJid
+import io.github.usmandurrany.tether.core.ClientPolicy
+import io.github.usmandurrany.tether.core.ConnectionOptions
+import io.github.usmandurrany.tether.core.CredentialVault
+import io.github.usmandurrany.tether.core.FileKeyValueStore
+import io.github.usmandurrany.tether.core.KeyValueStore
+import io.github.usmandurrany.tether.core.TetherJvm
+import io.github.usmandurrany.tether.core.TrafficLogger
+import io.github.usmandurrany.tether.core.XmppClient
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import java.nio.file.Path
+
+/**
+ * A ready [TetherChat] for a desktop or server JVM: the simple way to start.
+ *
+ * ```
+ * val chat = TetherJvm.chat(BareJid.parse("alice@example.com"), password)  // later runs: no password
+ * chat.connect()
+ * ```
+ *
+ * Logs in with [password] when given, otherwise with the keys the last login
+ * saved in [store] (throws [IllegalArgumentException] when there are none).
+ * State and login keys are kept in [store]: by default a file only this user
+ * can read, `~/.tether/<account>.properties`. The client runs on its own
+ * background threads until [TetherChat.close].
+ *
+ * Tell the chat when the window loses or gains focus with
+ * `chat.client.setForeground(...)`, so read markers only go out while the user
+ * can see the chat, and about network changes with `chat.client.networkChanged(...)`.
+ */
+public suspend fun TetherJvm.chat(
+    jid: BareJid,
+    password: String? = null,
+    features: ChatFeatures = ChatFeatures(),
+    options: ConnectionOptions = ConnectionOptions(),
+    policy: ClientPolicy = ClientPolicy(),
+    store: KeyValueStore = FileKeyValueStore(defaultStorePath(jid)),
+    messageStore: MessageStore? = null,
+    logger: TrafficLogger? = null,
+): TetherChat {
+    val vault = CredentialVault(store)
+    val config = options.configFor(jid, password, vault)
+    val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    val client = XmppClient(negotiator(config, logger), scope, policy, store = store, credentials = vault)
+    return TetherChat(client, features, store, messageStore)
+}
+
+private fun defaultStorePath(jid: BareJid): Path =
+    Path.of(System.getProperty("user.home"), ".tether", "$jid.properties")
