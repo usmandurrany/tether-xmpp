@@ -1,0 +1,179 @@
+# OpenSSL and socket helpers for the Linux native transport. The C below keeps
+# OpenSSL's macros and the sockaddr handling out of Kotlin.
+headers = openssl/ssl.h openssl/err.h openssl/x509.h openssl/x509v3.h openssl/evp.h openssl/objects.h
+headerFilter = openssl/**
+compilerOpts.linux = -idirafter /usr/include -idirafter /usr/include/x86_64-linux-gnu
+linkerOpts.linux = /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so --allow-shlib-undefined
+package = io.github.usmandurrany.tether.transport.tls
+
+---
+
+#include <errno.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+
+/* Connects to host:port, trying each address in turn with a timeout. Returns the fd, or -1. */
+static inline int tether_tcp_connect(const char* host, int port, int timeout_ms) {
+    struct addrinfo hints, *res = 0, *ai;
+    char service[8];
+    int fd = -1;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    snprintf(service, sizeof service, "%d", port);
+    if (getaddrinfo(host, service, &hints, &res) != 0) return -1;
+    for (ai = res; ai && fd < 0; ai = ai->ai_next) {
+        int s = socket(ai->ai_family, ai->ai_socktype | SOCK_CLOEXEC, ai->ai_protocol);
+        if (s < 0) continue;
+        int flags = fcntl(s, F_GETFL, 0);
+        fcntl(s, F_SETFL, flags | O_NONBLOCK);
+        int rc = connect(s, ai->ai_addr, ai->ai_addrlen);
+        if (rc < 0 && errno == EINPROGRESS) {
+            struct pollfd p = { s, POLLOUT, 0 };
+            rc = poll(&p, 1, timeout_ms);
+            if (rc == 1) {
+                int err = 0; socklen_t len = sizeof err;
+                getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len);
+                rc = err == 0 ? 0 : -1;
+            } else {
+                rc = -1;
+            }
+        }
+        if (rc == 0) {
+            fcntl(s, F_SETFL, flags);
+            int one = 1;
+            setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+            setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+            fd = s;
+        } else {
+            close(s);
+        }
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+/* One DNS question over UDP to an IPv4 or IPv6 server. Returns the answer length, or -1. */
+static inline int tether_udp_exchange(const char* server, int port, const unsigned char* query, int query_len,
+                                      unsigned char* answer, int answer_cap, int timeout_ms) {
+    struct addrinfo hints, *res = 0;
+    char service[8];
+    memset(&hints, 0, sizeof hints);
+    hints.ai_flags = AI_NUMERICHOST;
+    hints.ai_socktype = SOCK_DGRAM;
+    snprintf(service, sizeof service, "%d", port);
+    if (getaddrinfo(server, service, &hints, &res) != 0) return -1;
+    int s = socket(res->ai_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    int n = -1;
+    /* connect() makes the kernel drop datagrams from any other address. */
+    if (s >= 0 && connect(s, res->ai_addr, res->ai_addrlen) == 0 && send(s, query, query_len, 0) == query_len) {
+        struct pollfd p = { s, POLLIN, 0 };
+        if (poll(&p, 1, timeout_ms) == 1) n = (int) recv(s, answer, answer_cap, 0);
+    }
+    if (s >= 0) close(s);
+    freeaddrinfo(res);
+    return n;
+}
+
+static inline int tether_is_ip(const char* host) {
+    unsigned char buf[16];
+    return inet_pton(AF_INET, host, buf) == 1 || inet_pton(AF_INET6, host, buf) == 1;
+}
+
+/* A TLS client on fd: TLS 1.2 minimum, SNI, and (when verify) chain and RFC 6125 name checks. */
+static inline SSL* tether_tls_new(int fd, const char* host, int verify) {
+    SSL_CTX* ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) return 0;
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_default_verify_paths(ctx);
+    SSL* ssl = SSL_new(ctx);
+    SSL_CTX_free(ctx); /* the SSL keeps its own reference */
+    if (!ssl) return 0;
+    if (!tether_is_ip(host)) SSL_set_tlsext_host_name(ssl, host);
+    if (verify) {
+        SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+        if (SSL_set1_host(ssl, host) != 1) { SSL_free(ssl); return 0; }
+        SSL_set_verify(ssl, SSL_VERIFY_PEER, 0);
+    } else {
+        SSL_set_verify(ssl, SSL_VERIFY_NONE, 0); /* pinned: the fingerprint is checked instead */
+    }
+    SSL_set_fd(ssl, fd);
+    return ssl;
+}
+
+static inline X509* tether_peer(SSL* ssl) {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+    return SSL_get1_peer_certificate(ssl);
+#else
+    return SSL_get_peer_certificate(ssl);
+#endif
+}
+
+/* DER of the leaf certificate into buf; returns its length, 0 when absent, -1 when buf is too small. */
+static inline int tether_peer_der(SSL* ssl, unsigned char* buf, int cap) {
+    X509* cert = tether_peer(ssl);
+    if (!cert) return 0;
+    int len = i2d_X509(cert, 0);
+    if (len > cap) { X509_free(cert); return -1; }
+    unsigned char* p = buf;
+    i2d_X509(cert, &p);
+    X509_free(cert);
+    return len;
+}
+
+/* 1 when the leaf certificate is within its validity period. */
+static inline int tether_peer_valid_now(SSL* ssl) {
+    X509* cert = tether_peer(ssl);
+    if (!cert) return 0;
+    int ok = X509_cmp_current_time(X509_get0_notBefore(cert)) < 0 && X509_cmp_current_time(X509_get0_notAfter(cert)) > 0;
+    X509_free(cert);
+    return ok;
+}
+
+/* The certificate signature's hash size in bits for tls-server-end-point, or 0 when undefined. */
+static inline int tether_peer_sig_bits(SSL* ssl) {
+    X509* cert = tether_peer(ssl);
+    if (!cert) return 0;
+    int md = 0, pk = 0, bits = 0;
+    if (OBJ_find_sigid_algs(X509_get_signature_nid(cert), &md, &pk)) {
+        if (md == NID_sha512) bits = 512;
+        else if (md == NID_sha384) bits = 384;
+        else if (md == NID_sha256 || md == NID_sha1 || md == NID_md5) bits = 256;
+    }
+    X509_free(cert);
+    return bits;
+}
+
+/* RFC 9266 tls-exporter: 32 bytes into out, only for TLS 1.3. */
+static inline int tether_tls_exporter(SSL* ssl, unsigned char* out) {
+    if (SSL_version(ssl) != TLS1_3_VERSION) return 0;
+    return SSL_export_keying_material(ssl, out, 32, "EXPORTER-Channel-Binding", 24, 0, 0, 0);
+}
+
+static inline const char* tether_tls_cipher(SSL* ssl) {
+    return SSL_CIPHER_get_name(SSL_get_current_cipher(ssl));
+}
+
+/* Text of the most recent OpenSSL error on this thread, for messages. */
+static inline void tether_tls_error(char* buf, int cap) {
+    unsigned long e = ERR_get_error();
+    if (e == 0) { snprintf(buf, cap, "no OpenSSL error"); return; }
+    ERR_error_string_n(e, buf, cap);
+    ERR_clear_error();
+}
+
+/* SHA-256/384/512 of data into out (64 bytes room); returns the digest length, or -1. */
+static inline int tether_digest(int bits, const unsigned char* data, int len, unsigned char* out) {
+    const EVP_MD* md = bits == 512 ? EVP_sha512() : bits == 384 ? EVP_sha384() : EVP_sha256();
+    unsigned int n = 0;
+    return EVP_Digest(data, (size_t) len, out, &n, md, 0) ? (int) n : -1;
+}
