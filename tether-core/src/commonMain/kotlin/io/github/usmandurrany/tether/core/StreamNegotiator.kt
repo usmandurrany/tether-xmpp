@@ -91,6 +91,9 @@ public class StreamNegotiator(
 ) {
     private val domain = config.jid.domain
 
+    /** The account this negotiator logs in to. */
+    public val account: BareJid get() = config.jid
+
     /**
      * Opens a session. With [resume], tries XEP-0198 resumption first and falls
      * back to a fresh bind; unconfirmed stanzas are carried over either way.

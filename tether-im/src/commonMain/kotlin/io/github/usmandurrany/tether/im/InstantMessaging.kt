@@ -16,6 +16,7 @@ import io.github.usmandurrany.tether.core.XmppClient
  */
 public class InstantMessaging(
     client: XmppClient,
+    /** Keeps the roster between runs, so reconnects only fetch changes. */
     rosterStore: RosterStore? = null,
     presence: OwnPresence = OwnPresence(),
 ) {

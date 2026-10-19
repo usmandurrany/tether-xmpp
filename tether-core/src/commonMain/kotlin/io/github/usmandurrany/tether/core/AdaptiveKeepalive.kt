@@ -67,7 +67,8 @@ public class AdaptiveKeepalive(private val policy: KeepalivePolicy = KeepalivePo
         }
     }
 
-    private companion object {
+    internal companion object {
+        /** The key for "network not reported"; cannot clash with a real id. */
         const val UNKNOWN = "\u0000unknown"
     }
 }

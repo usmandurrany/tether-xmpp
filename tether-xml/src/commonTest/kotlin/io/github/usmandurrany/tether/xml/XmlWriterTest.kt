@@ -59,3 +59,21 @@ class XmlWriterTest {
         assertEquals(true, s.startsWith("Element(name=a"))
     }
 }
+
+class XmlParseTest {
+    @Test
+    fun roundTripsThroughTheWriter() {
+        val original = element("message", "jabber:client") {
+            attribute("to", "romeo@example.net")
+            element("body") { text("a < b & 'c'") }
+            element("request", "urn:xmpp:receipts")
+        }
+        val xml = XmlWriter.toXml(original)
+        kotlin.test.assertEquals(original, XmlParse.element(xml))
+    }
+
+    @Test
+    fun defaultNamespaceApplies() {
+        kotlin.test.assertEquals("jabber:client", XmlParse.element("<presence/>", "jabber:client").namespace)
+    }
+}

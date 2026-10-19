@@ -5,7 +5,11 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
+import io.github.usmandurrany.tether.core.ClientPolicy
 import io.github.usmandurrany.tether.core.ConnectionControls
+import io.github.usmandurrany.tether.core.CredentialVault
+import io.github.usmandurrany.tether.core.KeyValueStore
+import io.github.usmandurrany.tether.core.XmppClient
 import io.github.usmandurrany.tether.core.StreamNegotiator
 import io.github.usmandurrany.tether.core.TrafficLogger
 import io.github.usmandurrany.tether.core.XmppConfig
@@ -26,10 +30,12 @@ import kotlinx.coroutines.launch
  * the app lifecycle and network monitor fed into a connection.
  *
  * ```
- * val negotiator = TetherAndroid.negotiator(context, config)
- * val supervisor = ConnectionSupervisor(scope, XmppSessionOpener(negotiator))
- * val binding = TetherAndroid.bind(context, supervisor, scope)
- * supervisor.connect()
+ * val store = TetherAndroid.secureStore(context)
+ * val vault = CredentialVault(store)
+ * val config = XmppConfig(jid, password = typedPassword ?: null, scramKeys = vault.loadKeys(jid))
+ * val client = TetherAndroid.client(context, config, appScope)
+ * val im = InstantMessaging(client)
+ * client.connect()
  * ```
  */
 public object TetherAndroid {
@@ -54,6 +60,33 @@ public object TetherAndroid {
 
     public fun negotiator(context: Context, config: XmppConfig, logger: TrafficLogger? = null): StreamNegotiator =
         StreamNegotiator(config, transportFactory(config.tls), endpointResolver(context.applicationContext), logger)
+
+    /** Encrypted storage for Tether's state and credentials (Android Keystore). */
+    public fun secureStore(context: Context, name: String = "tether"): KeyValueStore = AndroidSecureStore(context, name)
+
+    /**
+     * A client wired for Android: Android DNS and TLS, the app lifecycle and
+     * network fed in, state and login keys kept in [store]. Keep one per
+     * account for the life of the process, in an application-wide scope.
+     */
+    public fun client(
+        context: Context,
+        config: XmppConfig,
+        scope: CoroutineScope,
+        policy: ClientPolicy = ClientPolicy(),
+        store: KeyValueStore = secureStore(context),
+        logger: TrafficLogger? = null,
+    ): XmppClient {
+        val client = XmppClient(
+            negotiator(context, config, logger),
+            scope,
+            policy,
+            store = store,
+            credentials = CredentialVault(store),
+        )
+        bind(context, client, scope)
+        return client
+    }
 
     /**
      * Feeds [controls] from the process lifecycle (foreground when any activity

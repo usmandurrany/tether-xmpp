@@ -34,7 +34,13 @@ class XmppClientTest {
         server?.close()
     }
 
-    private fun client(fake: FakeXmppServer, policy: ClientPolicy = ClientPolicy()): XmppClient {
+    private fun client(
+        fake: FakeXmppServer,
+        policy: ClientPolicy = ClientPolicy(),
+        store: KeyValueStore? = null,
+        credentials: CredentialVault? = null,
+        clientScope: CoroutineScope = scope,
+    ): XmppClient {
         server = fake
         val config = XmppConfig(
             jid = BareJid("juliet", "localhost"),
@@ -46,7 +52,7 @@ class XmppClientTest {
             responseTimeoutMillis = 5_000,
         )
         val negotiator = StreamNegotiator(config, JvmSocketTransportFactory(config.tls), EndpointResolver(SrvLookup { emptyList() }))
-        return XmppClient(negotiator, scope, policy)
+        return XmppClient(negotiator, clientScope, policy, store = store, credentials = credentials)
     }
 
     private fun message(body: String, id: String? = null) = element("message", Ns.CLIENT) {
@@ -175,5 +181,52 @@ class XmppClientTest {
         assertEquals(listOf("b", "d"), ids, "the lost one is re-sent first, then the new one, each once")
         withTimeout(10_000) { while (client.state.value !is ConnectionState.Online) delay(20) }
         assertEquals(null, fake.fromClient.poll(300, TimeUnit.MILLISECONDS))
+    }
+
+    @Test
+    fun aRestartedAppResumesTheSavedSessionAndResendsWhatWasLost() = runBlocking<Unit> {
+        val fake = FakeXmppServer(streamManagement = true, silent = true)
+        val store = MemoryKeyValueStore()
+        val firstRun = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val first = client(fake, store = store, clientScope = firstRun)
+        withTimeout(10_000) { first.connect() }
+        first.send(message("one", id = "s1"))
+        first.send(message("two", id = "s2"))
+        repeat(2) { fake.nextFromClient() }
+        first.save()
+        // The process dies: no goodbye, the socket just goes.
+        firstRun.cancel()
+        fake.lostInTransit = 1
+        fake.silent = false
+        fake.dropConnection()
+
+        val second = client(fake, store = store)
+        withTimeout(10_000) { second.connect() }
+        assertEquals(1, fake.resumes, "resumed from the saved state, no new login")
+        assertEquals("s2", fake.nextFromClient().attribute("id"), "only what the server never got is sent again")
+        assertEquals(null, fake.fromClient.poll(300, TimeUnit.MILLISECONDS))
+    }
+
+    @Test
+    fun theOutboxSurvivesARestart() = runBlocking<Unit> {
+        val fake = FakeXmppServer(streamManagement = true)
+        val store = MemoryKeyValueStore()
+        val first = client(fake, store = store, clientScope = CoroutineScope(SupervisorJob() + Dispatchers.IO))
+        first.send(message("queued offline", id = "q1"))
+        first.save()
+        first.close() // the app is killed before it ever connected
+        val second = client(fake, store = store)
+        withTimeout(10_000) { second.connect() }
+        val ids = generateSequence { fake.fromClient.poll(1, TimeUnit.SECONDS) }.map { it.attribute("id") }.toList()
+        assertTrue("q1" in ids, "the queued message was delivered: $ids")
+    }
+
+    @Test
+    fun loginKeysAreSavedForPasswordlessLogins() = runBlocking<Unit> {
+        val fake = FakeXmppServer(streamManagement = true)
+        val vault = CredentialVault(MemoryKeyValueStore())
+        val client = client(fake, credentials = vault)
+        withTimeout(10_000) { client.connect() }
+        assertEquals(1, vault.loadKeys(BareJid.parse("juliet@localhost")).size)
     }
 }
