@@ -27,6 +27,15 @@ class PresencesTest {
     }
 
     @Test
+    fun aSessionResumedAfterARestartAnnouncesAgainSoContactsAreProbed() = runTest {
+        val sender = FakeSender()
+        val presences = Presences(sender, OwnPresence(Show.DND))
+        presences.onSessionStarted(FakeSession(sender, resumed = true))
+        assertEquals(listOf("unavailable", null), sender.sent.map { it.attribute("type") })
+        assertEquals("dnd", sender.sent.last().child("show")?.text)
+    }
+
+    @Test
     fun tracksContactResources() = runTest {
         val sender = FakeSender()
         val presences = Presences(sender)
