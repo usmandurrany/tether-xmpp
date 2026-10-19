@@ -24,6 +24,7 @@ public class InstantMessaging(
     public val presences: Presences = Presences(client, presence)
     public val messaging: Messaging = Messaging(client)
     public val history: History = History(client)
+    public val push: Push = Push(client)
 
     init {
         client.install(roster)
@@ -31,5 +32,6 @@ public class InstantMessaging(
         client.install(presences)
         client.install(messaging)
         client.install(history)
+        client.install(push)
     }
 }
