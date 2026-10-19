@@ -17,6 +17,10 @@ cp xmpp-test.properties.example xmpp-test.properties   # git-ignored; fill in yo
 
 If the server uses a self-signed certificate, the probe prints its SHA-256 fingerprint and the `tls.pin=` line to add. Requires JDK 17 or newer.
 
+## Debugging
+
+`tether-debug` logs every stanza sent and received (with credentials always redacted) to the console, an in-app screen or a self-hosted log portal for testing rounds. See [docs/debug-tools.md](docs/debug-tools.md).
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE). You may use, modify and redistribute it freely; redistributions must keep the copyright and the [NOTICE](NOTICE) file crediting the original author.
