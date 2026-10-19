@@ -31,3 +31,6 @@ dependencyResolutionManagement {
 include(":tether-xml")
 include(":tether-crypto")
 include(":tether-sasl")
+include(":tether-transport")
+include(":tether-core")
+include(":tools:probe")
