@@ -44,6 +44,6 @@ class HttpLogUploaderTest {
     fun detectsTheDesktopPlatform() {
         val device = DeviceInfo.current("id-1", appVersion = "2.0")
         assertTrue(device.platform in setOf("linux", "macos", "windows"), device.platform)
-        assertTrue(device.model!!.startsWith("JVM "))
+        assertTrue(device.osVersion!!.contains("(JVM "))
     }
 }

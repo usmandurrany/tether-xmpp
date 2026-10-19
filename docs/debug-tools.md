@@ -2,7 +2,7 @@
 
 `tether-debug` shows the XML a client sends and receives, adds the app's own
 events to the same log, and can upload everything close to real time to a
-self-hosted log portal ([tether-log](https://github.com/usmandurrany/tether-log))
+self-hosted log portal ([tether-debug](https://github.com/usmandurrany/tether-debug))
 during a testing round.
 
 It is a separate module that plugs into the core through the existing

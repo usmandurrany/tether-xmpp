@@ -10,8 +10,9 @@ internal actual fun currentPlatform(): PlatformInfo = android() ?: PlatformInfo(
             else -> it.ifEmpty { "jvm" }
         }
     },
-    osVersion = System.getProperty("os.version"),
-    model = "JVM ${System.getProperty("java.version")}",
+    osVersion = "${System.getProperty("os.version")} (JVM ${System.getProperty("java.version")})",
+    model = null, // desktops have no meaningful model; apps can set one, such as the host name
+
 )
 
 private fun android(): PlatformInfo? = try {
