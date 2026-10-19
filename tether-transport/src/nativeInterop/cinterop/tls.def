@@ -1,6 +1,6 @@
 # OpenSSL and socket helpers for the Linux native transport. The C below keeps
 # OpenSSL's macros and the sockaddr handling out of Kotlin.
-headers = openssl/ssl.h openssl/err.h openssl/x509.h openssl/evp.h openssl/objects.h
+headers = openssl/ssl.h openssl/err.h openssl/x509.h openssl/x509v3.h openssl/evp.h openssl/objects.h
 headerFilter = openssl/**
 compilerOpts.linux = -idirafter /usr/include -idirafter /usr/include/x86_64-linux-gnu
 linkerOpts.linux = /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so --allow-shlib-undefined

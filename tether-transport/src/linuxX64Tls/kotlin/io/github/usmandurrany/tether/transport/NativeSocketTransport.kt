@@ -45,8 +45,6 @@ import platform.posix.shutdown
 import io.github.usmandurrany.tether.transport.tls.tether_digest
 import kotlin.concurrent.atomics.AtomicInt
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
-import kotlin.concurrent.atomics.decrementAndFetch
-import kotlin.concurrent.atomics.incrementAndFetch
 
 /**
  * TCP/TLS transport for Linux native, on POSIX sockets and the system's
@@ -192,12 +190,12 @@ internal class NativeSocketTransport(
 
     /** Runs [block] while counting as a user; the last user out after close() frees everything. */
     private inline fun <T> using(block: () -> T): T {
-        users.incrementAndFetch()
+        users.addAndFetch(1)
         try {
             if (state.load() != OPEN) throw TransportException("Connection closed")
             return block()
         } finally {
-            if (users.decrementAndFetch() == 0 && state.load() == CLOSING) release()
+            if (users.addAndFetch(-1) == 0 && state.load() == CLOSING) release()
         }
     }
 
