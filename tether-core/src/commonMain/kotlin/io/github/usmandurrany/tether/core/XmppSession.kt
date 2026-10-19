@@ -18,6 +18,16 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.concurrent.Volatile
 import kotlin.io.encoding.Base64
 
+/** Saved XEP-0198 state. [resumptionId] is null when the session cannot be resumed. */
+internal class SmSnapshot(
+    val resumptionId: String?,
+    val location: String?,
+    val maxResumeSeconds: Int?,
+    val inbound: Long,
+    val acknowledged: Long,
+    val pending: List<Element>,
+)
+
 /** Tuning for a live session. */
 public data class SessionPolicy(
     /** With SM on, ask the server to confirm after this many unconfirmed stanzas (XEP-0198 §4). */
@@ -87,6 +97,22 @@ public class XmppSession private constructor(
     public suspend fun send(stanza: Element) {
         require(StreamManagement.isStanza(stanza)) { "Only message, presence and iq stanzas can be sent" }
         lock.withLock { sendLocked(withId(stanza)) }
+    }
+
+    /** Keys derived at login (null for a resumed session or PLAIN); store them to log in without the password. */
+    public val scramKeys: io.github.usmandurrany.tether.sasl.ScramKeys? get() = negotiated.scramKeys
+
+    /** Set when this session was ended with `</stream:stream>`: the server dropped it, so it cannot be resumed. */
+    @Volatile
+    internal var endedGracefully: Boolean = false
+        private set
+
+    /** The SM state to save, so a restarted app can resume or re-send. Null without SM. */
+    internal suspend fun smSnapshot(): SmSnapshot? {
+        val sm = sm ?: return null
+        return lock.withLock {
+            SmSnapshot(sm.resumptionId?.takeUnless { endedGracefully }, sm.location, sm.maxResumeSeconds, sm.inbound, sm.acknowledged, sm.pending)
+        }
     }
 
     /** False once the session has ended or been closed. */
@@ -221,6 +247,7 @@ public class XmppSession private constructor(
      */
     override suspend fun closeGracefully() {
         if (closed) return
+        endedGracefully = true
         try {
             if (sm != null && lock.withLock { sm.unackedCount } > 0) {
                 withTimeoutOrNull(2_000) { probe() }
@@ -371,14 +398,22 @@ public class XmppSessionOpener(
     private val onConfirmed: ((List<Element>) -> Unit)? = null,
 ) : SessionOpener {
     private var previous: XmppSession? = null
+    private var restored: ResumeRequest? = null
+
+    /** Resumes a session saved by an earlier run, on the next open, if no session has been opened since. */
+    internal fun restore(request: ResumeRequest) {
+        if (previous == null) restored = request
+    }
 
     override suspend fun open(): XmppSession {
         val last = previous
         // The old read loop must have stopped so its SM counters are final.
         last?.awaitEnded(timeoutMillis = 5_000)
-        val resume = last?.streamManagement?.let { ResumeRequest(it, last.jid, last.capabilities) }
+        // A saved session is tried until an attempt gets through, whatever its outcome then.
+        val resume = if (last == null) restored else last.streamManagement?.let { ResumeRequest(it, last.jid, last.capabilities) }
         val session = XmppSession.start(negotiator.negotiate(resume), policy, onConfirmed)
         previous = session
+        restored = null
         return session
     }
 }

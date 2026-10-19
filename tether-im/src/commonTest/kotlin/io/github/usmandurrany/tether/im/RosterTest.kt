@@ -83,3 +83,14 @@ class RosterTest {
         Roster(sender).onSessionStarted(FakeSession(sender))
     }
 }
+
+class StoredRosterTest {
+    @Test
+    fun roundTrips() = kotlinx.coroutines.test.runTest {
+        val store = StoredRoster(io.github.usmandurrany.tether.core.MemoryKeyValueStore(), BareJid.parse("juliet@example.com"))
+        assertNull(store.load())
+        val snapshot = RosterSnapshot("v9", listOf(RosterItem(BareJid.parse("romeo@example.net"), "Romeo & co", Subscription.BOTH, true, setOf("A", "B"))))
+        store.save(snapshot)
+        assertEquals(snapshot, store.load())
+    }
+}

@@ -18,10 +18,18 @@ public object TetherJvm {
     public fun negotiator(config: XmppConfig, logger: TrafficLogger? = null): StreamNegotiator =
         StreamNegotiator(config, JvmSocketTransportFactory(config.tls, tlsProvider), EndpointResolver(JndiSrvLookup()), logger)
 
+    /** [store] keeps state and login keys between runs; see [FileKeyValueStore]. */
     public fun client(
         config: XmppConfig,
         scope: CoroutineScope,
         policy: ClientPolicy = ClientPolicy(),
+        store: KeyValueStore? = null,
         logger: TrafficLogger? = null,
-    ): XmppClient = XmppClient(negotiator(config, logger), scope, policy)
+    ): XmppClient = XmppClient(
+        negotiator(config, logger),
+        scope,
+        policy,
+        store = store,
+        credentials = store?.let(::CredentialVault),
+    )
 }

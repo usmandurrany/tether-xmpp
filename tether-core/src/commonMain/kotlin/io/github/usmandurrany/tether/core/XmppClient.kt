@@ -9,6 +9,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -102,6 +104,11 @@ public class OutboxFullException(public val stanza: Element) : Exception("The ou
  *   [connect]: stanzas with no collector are dropped.
  * - When the server offers CSI (XEP-0352), the client reports active and
  *   inactive with the app's foreground state.
+ * - With a [store], unconfirmed stanzas, the outbox, the session to resume
+ *   and learned keepalive timing survive a restart of the app. It is saved
+ *   shortly after every change and at once when the app goes to the background.
+ * - With [credentials], the SCRAM keys of each login are saved there, so the
+ *   next run can log in without the password.
  *
  * Use one client per account per process.
  */
@@ -109,8 +116,13 @@ public class XmppClient(
     negotiator: StreamNegotiator,
     parentScope: CoroutineScope,
     private val policy: ClientPolicy = ClientPolicy(),
-    keepalive: AdaptiveKeepalive? = AdaptiveKeepalive(),
+    private val keepalive: AdaptiveKeepalive? = AdaptiveKeepalive(),
+    private val store: KeyValueStore? = null,
+    private val credentials: CredentialVault? = null,
 ) : ConnectionControls, StanzaSender {
+    /** The account this client logs in to. */
+    public val account: BareJid = negotiator.account
+
     private val scope = CoroutineScope(parentScope.coroutineContext + SupervisorJob(parentScope.coroutineContext[Job]))
     private val extensions = ArrayList<ClientExtension>()
     private val sending = Mutex()
@@ -124,12 +136,15 @@ public class XmppClient(
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
 
-    private val supervisor = ConnectionSupervisor(
-        scope,
-        ClientOpener(XmppSessionOpener(negotiator, policy.session) { confirmed -> onConfirmed(confirmed) }),
-        policy.reconnect,
-        keepalive = keepalive,
-    )
+    private val opener = XmppSessionOpener(negotiator, policy.session) { confirmed -> onConfirmed(confirmed) }
+    private val supervisor = ConnectionSupervisor(scope, ClientOpener(opener), policy.reconnect, keepalive = keepalive)
+
+    @kotlin.concurrent.Volatile
+    private var lastSession: XmppSession? = null
+    private val persistence = Mutex()
+    private var restored = false
+    private val saveRequests = Channel<Unit>(Channel.CONFLATED)
+    private val stateKey = "tether.state.$account"
 
     public val state: StateFlow<ConnectionState> get() = supervisor.state
 
@@ -147,6 +162,14 @@ public class XmppClient(
         scope.launch {
             foreground.collect { fg -> _session.value?.let { reportActivity(it, fg) } }
         }
+        if (store != null) {
+            scope.launch {
+                for (request in saveRequests) {
+                    delay(SAVE_DEBOUNCE_MILLIS) // one write for a burst of changes
+                    runCatching { save() }
+                }
+            }
+        }
     }
 
     /** Adds a feature. Install everything before [connect]. */
@@ -155,10 +178,62 @@ public class XmppClient(
         extensions += extension
     }
 
-    public suspend fun connect(): ConnectResult = supervisor.connect()
+    public suspend fun connect(): ConnectResult {
+        restore()
+        return supervisor.connect()
+    }
 
     public suspend fun disconnect() {
         supervisor.disconnect()
+        runCatching { save() }
+    }
+
+    /**
+     * Writes the current state to the [store] now. Called automatically; apps
+     * may also call it when the OS warns that the process may be killed.
+     */
+    public suspend fun save() {
+        val store = store ?: return
+        persistence.withLock {
+            if (!restored) return // never overwrite saved state that has not been read yet
+            val last = lastSession
+            val snapshot = last?.smSnapshot()
+            val resume = if (last != null && snapshot?.resumptionId != null) {
+                ClientState.SavedResume(
+                    last.jid,
+                    snapshot,
+                    last.capabilities.streamFeatures,
+                    last.capabilities.server.features,
+                    last.capabilities.account.features,
+                )
+            } else {
+                null
+            }
+            val unsent = (if (resume == null) snapshot?.pending.orEmpty() else emptyList()) + sending.withLock { outbox.toList() }
+            val learned = runCatching { keepalive?.snapshot() }.getOrNull().orEmpty()
+            val state = ClientState(resume, unsent, learned)
+            store.put(stateKey, if (resume == null && unsent.isEmpty() && learned.isEmpty()) null else state.encode())
+        }
+    }
+
+    /** Loads what an earlier run saved, once, before the first connection. */
+    private suspend fun restore() {
+        val store = store
+        persistence.withLock {
+            if (restored) return
+            restored = true
+            val saved = store?.let { runCatching { it.get(stateKey) }.getOrNull() }?.let(ClientState::decode) ?: return
+            sending.withLock {
+                // Older than anything sent since start-up, so they go first.
+                saved.unsent.asReversed().forEach { outbox.addFirst(it) }
+            }
+            saved.resume?.let { opener.restore(it.toRequest()) }
+            keepalive?.restore(saved.keepalive)
+        }
+    }
+
+    private fun saveSoon() {
+        if (store != null) saveRequests.trySend(Unit)
     }
 
     /** Stops for good and closes the connection. */
@@ -175,6 +250,8 @@ public class XmppClient(
     override fun setForeground(foreground: Boolean) {
         this.foreground.value = foreground
         supervisor.setForeground(foreground)
+        // The OS may kill a background app at any moment: save now, not later.
+        if (!foreground && store != null) scope.launch { runCatching { save() } }
     }
 
     /**
@@ -184,13 +261,16 @@ public class XmppClient(
      */
     override suspend fun send(stanza: Element) {
         require(StreamManagement.isStanza(stanza)) { "Only message, presence and iq stanzas can be sent" }
+        restore() // a send before the first connect must not be saved over what an earlier run left
         val stamped = withId(stanza)
         sending.withLock {
             val live = _session.value
-            if (live != null && live.offer(stamped)) return
-            if (outbox.size >= policy.maxOutbox) throw OutboxFullException(stamped)
-            outbox.addLast(stamped)
+            if (live == null || !live.offer(stamped)) {
+                if (outbox.size >= policy.maxOutbox) throw OutboxFullException(stamped)
+                outbox.addLast(stamped)
+            }
         }
+        saveSoon()
     }
 
     /**
@@ -219,6 +299,7 @@ public class XmppClient(
     private fun onConfirmed(stanzas: List<Element>) {
         stanzas.forEach { _confirmed.tryEmit(it) }
         extensions.forEach { runCatching { it.onConfirmed(stanzas) } }
+        saveSoon()
     }
 
     private suspend fun dispatch(stanza: Element) {
@@ -247,10 +328,12 @@ public class XmppClient(
     private inner class ClientOpener(private val inner: SessionOpener) : SessionOpener {
         override suspend fun open(): LiveSession {
             val session = inner.open() as XmppSession
+            lastSession = session
             val reader = scope.launch {
                 launch { session.incoming.collect { dispatch(it) } }
                 session.awaitClosed()
                 _session.compareAndSet(session, null)
+                saveSoon()
             }
             try {
                 val context = object : SessionContext {
@@ -275,6 +358,8 @@ public class XmppClient(
                 }
                 // It may have ended meanwhile; the reader has then already run.
                 if (!session.isOpen) _session.compareAndSet(session, null)
+                if (!session.resumed) session.scramKeys?.let { keys -> runCatching { credentials?.saveKeys(account, keys) } }
+                saveSoon()
                 return session
             } catch (t: Throwable) {
                 session.close()
@@ -285,6 +370,8 @@ public class XmppClient(
     }
 
     internal companion object {
+        const val SAVE_DEBOUNCE_MILLIS = 500L
+
         /** 128 random bits: unique without coordination, also across restarts. */
         fun newStanzaId(): String =
             Random.nextLong().toULong().toString(36) + Random.nextLong().toULong().toString(36)
