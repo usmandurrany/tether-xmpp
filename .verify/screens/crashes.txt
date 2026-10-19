@@ -1,0 +1,1 @@
+10-19 18:29:15.421   973   973 I AndroidRuntime: VM exiting with result code 0, cleanup skipped.
