@@ -1,0 +1,12 @@
+# Copy to xmpp-test.properties (git-ignored) and fill in. Never commit real credentials.
+jid=user@example.com
+password=change-me
+# Optional: skip DNS SRV and connect here.
+#host=xmpp.example.com
+#port=5222
+#directTls=false
+# Optional: accept a self-signed certificate by its SHA-256 fingerprint (the probe prints it).
+#tls.pin=0123...abcd
+# Optional: allow PLAIN (only used over verified TLS).
+#sasl.allowPlain=false
+#resource=tether-probe
