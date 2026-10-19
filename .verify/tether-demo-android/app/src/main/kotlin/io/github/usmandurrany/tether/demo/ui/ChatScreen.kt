@@ -98,7 +98,7 @@ fun ChatScreen(session: TetherSession, peer: BareJid, onBack: () -> Unit) {
         session.conversations.openChat = peer
         onDispose {
             session.conversations.openChat = null
-            if (composing) scope.launch { session.sendChatState(peer, ChatState.PAUSED) }
+            if (composing) session.sendChatStateLater(peer, ChatState.PAUSED)
         }
     }
     LaunchedEffect(peer, historyAvailable) { if (historyAvailable && oldest == null && !archiveDone) loadHistory() }

@@ -156,6 +156,11 @@ class TetherSession private constructor(
         runCatching { im.messaging.sendChatState(to, state) }
     }
 
+    /** For callers that are going away, such as a closing chat screen. */
+    fun sendChatStateLater(to: BareJid, state: ChatState) {
+        scope.launch { sendChatState(to, state) }
+    }
+
     // --- Contacts and presence -------------------------------------------------------
 
     /** Adds the contact to the roster and asks to see their presence. */

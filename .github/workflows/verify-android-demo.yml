@@ -34,3 +34,46 @@ jobs:
           path: |
             ${{ env.DEMO }}/app/build/outputs/apk/debug/*.apk
             ${{ env.DEMO }}/app/build/reports/lint-results-debug.html
+
+  # Installs the APK on an emulator, opens it, and takes screenshots, to catch
+  # crashes at start-up and broken layouts.
+  smoke:
+    needs: apk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tether-demo-debug
+          path: out
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          script: |
+            adb install -r out/outputs/apk/debug/app-debug.apk
+            adb shell am start -W -n io.github.usmandurrany.tether.demo/.MainActivity
+            sleep 10
+            adb exec-out screencap -p > settings-top.png
+            adb shell input swipe 500 1800 500 400 300
+            sleep 2
+            adb exec-out screencap -p > settings-middle.png
+            adb shell input swipe 500 1800 500 400 300
+            adb shell input swipe 500 1800 500 400 300
+            sleep 2
+            adb exec-out screencap -p > settings-bottom.png
+            adb logcat -d > logcat.txt
+            adb shell pidof io.github.usmandurrany.tether.demo
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: smoke-screenshots
+          path: |
+            *.png
+            logcat.txt
