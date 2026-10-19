@@ -5,3 +5,7 @@ A lean, modular XMPP SDK built with Kotlin Multiplatform. UI-agnostic, with an e
 First targets: **Android (API 26+)** and **Linux (JVM, then Kotlin/Native)**. iOS, macOS, Windows and Web are planned.
 
 Status: early development. See [docs/design.md](docs/design.md) for the architecture and roadmap.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). You may use, modify and redistribute it freely; redistributions must keep the copyright and the [NOTICE](NOTICE) file crediting the original author.
