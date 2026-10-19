@@ -57,15 +57,22 @@ public class StreamManagement internal constructor(
     /**
      * Applies `<a h='…'/>` (or the `h` of `<resumed/>`/`<failed/>`).
      * Returns false when the server confirms more than we sent, which XEP-0198 §4
-     * treats as a fatal protocol error.
+     * treats as a fatal protocol error. Confirmed stanzas go to [onConfirmed].
      */
     internal fun onAck(h: Long): Boolean {
         val newlyAcked = (h - acknowledged) and MASK
         if (newlyAcked > unacked.size) return false
-        repeat(newlyAcked.toInt()) { unacked.removeFirst() }
+        val confirmed = List(newlyAcked.toInt()) { unacked.removeFirst() }
         acknowledged = h and MASK
+        if (confirmed.isNotEmpty()) onConfirmed?.invoke(confirmed)
         return true
     }
+
+    /**
+     * Called with the stanzas the server has just confirmed, oldest first,
+     * while the session's lock is held: must not block.
+     */
+    internal var onConfirmed: ((List<Element>) -> Unit)? = null
 
     /**
      * Takes every unconfirmed stanza out of the queue so it can be sent again,

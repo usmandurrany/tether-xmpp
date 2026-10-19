@@ -81,6 +81,45 @@ public class XmppSession private constructor(
         lock.withLock { sendLocked(withId(stanza)) }
     }
 
+    /** False once the session has ended or been closed. */
+    public val isOpen: Boolean get() = !closed
+
+    /**
+     * Like [send], but reports instead of throwing whether the stanza was taken:
+     * with SM, queued (so it survives a dropped connection); without SM, written.
+     * False means it was not sent at all and the caller still owns it.
+     */
+    internal suspend fun offer(stanza: Element): Boolean = lock.withLock {
+        if (closed) return@withLock false
+        if (sm == null) {
+            try {
+                write(withId(stanza))
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                false
+            }
+        } else {
+            try {
+                sendLocked(withId(stanza))
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                // Already in the SM queue: the next session sends it again.
+            }
+            true
+        }
+    }
+
+    /** Writes a top-level element that is not a stanza (CSI, for example). SM does not count it. */
+    internal suspend fun sendNonza(element: Element) {
+        lock.withLock {
+            if (closed) throw XmppNegotiationException(NegotiationFailure.CONNECTION_LOST, "Session is closed")
+            write(element)
+        }
+    }
+
     /** Sends an IQ get/set and waits for its result or error. */
     public suspend fun request(iq: Element, timeoutMillis: Long = 30_000): Element {
         require(iq.name == "iq" && iq.namespace == Ns.CLIENT && iq.attribute("type") in setOf("get", "set"))
@@ -285,8 +324,13 @@ public class XmppSession private constructor(
          * Starts a session: first re-sends what the previous session never got
          * confirmed, then queues stanzas that arrived during negotiation.
          */
-        suspend fun start(negotiated: NegotiatedSession, policy: SessionPolicy): XmppSession {
+        suspend fun start(
+            negotiated: NegotiatedSession,
+            policy: SessionPolicy,
+            onConfirmed: ((List<Element>) -> Unit)? = null,
+        ): XmppSession {
             val session = XmppSession(negotiated, policy)
+            negotiated.streamManagement?.onConfirmed = onConfirmed
             val carried = negotiated.carryOver?.drainPending().orEmpty()
             session.lock.withLock { carried.forEach { session.sendLocked(it) } }
             negotiated.reader.takeUnclaimed().forEach { session.deliver(it) }
@@ -305,6 +349,11 @@ public class XmppSession private constructor(
 public class XmppSessionOpener(
     private val negotiator: StreamNegotiator,
     private val policy: SessionPolicy = SessionPolicy(),
+    /**
+     * Called with stanzas the server confirmed through XEP-0198, oldest first,
+     * on the reading coroutine with the session lock held: hand them off, don't block.
+     */
+    private val onConfirmed: ((List<Element>) -> Unit)? = null,
 ) : SessionOpener {
     private var previous: XmppSession? = null
 
@@ -313,7 +362,7 @@ public class XmppSessionOpener(
         // The old read loop must have stopped so its SM counters are final.
         last?.awaitEnded(timeoutMillis = 5_000)
         val resume = last?.streamManagement?.let { ResumeRequest(it, last.jid, last.capabilities) }
-        val session = XmppSession.start(negotiator.negotiate(resume), policy)
+        val session = XmppSession.start(negotiator.negotiate(resume), policy, onConfirmed)
         previous = session
         return session
     }

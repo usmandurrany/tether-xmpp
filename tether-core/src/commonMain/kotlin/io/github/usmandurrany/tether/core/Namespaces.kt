@@ -13,4 +13,5 @@ internal object Ns {
     const val DISCO_INFO = "http://jabber.org/protocol/disco#info"
     const val SM = "urn:xmpp:sm:3"
     const val PING = "urn:xmpp:ping"
+    const val CSI = "urn:xmpp:csi:0"
 }
