@@ -70,7 +70,9 @@ class StreamNegotiatorTest {
         assertEquals(TestCertificate.sha256Hex, session.tls.peerCertificateSha256)
         assertNotNull(session.featuresBeforeTls?.child("starttls", "urn:ietf:params:xml:ns:xmpp-tls"))
         // Capabilities come only from what the server advertised.
-        assertTrue(session.capabilities.hasStreamFeature("sm", "urn:xmpp:sm:3"))
+        assertTrue(session.capabilities.hasStreamFeature("csi", "urn:xmpp:csi:0"))
+        assertFalse(session.capabilities.hasStreamFeature("sm", "urn:xmpp:sm:3"))
+        assertNull(session.streamManagement, "SM is never enabled unless advertised")
         assertTrue(session.capabilities.serverSupports("urn:xmpp:carbons:2"))
         assertFalse(session.capabilities.account.available)
         assertTrue(fake.failures.isEmpty(), "server saw: ${fake.failures}")

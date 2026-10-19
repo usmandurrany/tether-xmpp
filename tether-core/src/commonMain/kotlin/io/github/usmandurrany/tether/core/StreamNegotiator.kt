@@ -51,7 +51,23 @@ public class NegotiatedSession internal constructor(
     /** Stream features at each stage, for diagnostics: before TLS (null for direct TLS), after TLS, after login. */
     public val featuresBeforeTls: Element?,
     public val featuresAfterTls: Element,
+    /** XEP-0198 state, when the server offered SM and accepted `<enable/>`. */
+    public val streamManagement: StreamManagement?,
+    /** True when an earlier SM session was resumed instead of starting fresh. */
+    public val resumed: Boolean,
+    /**
+     * The previous SM session, whose unconfirmed stanzas the new session sends
+     * first. Left untouched until then, so a failed attempt loses nothing.
+     */
+    internal val carryOver: StreamManagement?,
     internal val reader: StanzaReader,
+)
+
+/** What a new attempt needs to resume the previous session (XEP-0198 §5). */
+public class ResumeRequest(
+    public val streamManagement: StreamManagement,
+    public val jid: FullJid,
+    public val capabilities: ServerCapabilities,
 )
 
 /**
@@ -75,10 +91,14 @@ public class StreamNegotiator(
 ) {
     private val domain = config.jid.domain
 
-    public suspend fun negotiate(): NegotiatedSession {
+    /**
+     * Opens a session. With [resume], tries XEP-0198 resumption first and falls
+     * back to a fresh bind; unconfirmed stanzas are carried over either way.
+     */
+    public suspend fun negotiate(resume: ResumeRequest? = null): NegotiatedSession {
         val transport = connect()
         try {
-            return negotiateOn(transport)
+            return negotiateOn(transport, resume)
         } catch (t: Throwable) {
             transport.close()
             throw when (t) {
@@ -115,7 +135,7 @@ public class StreamNegotiator(
         throw XmppNegotiationException(NegotiationFailure.UNREACHABLE, "Could not connect: ${errors.joinToString("; ")}")
     }
 
-    private suspend fun negotiateOn(transport: XmppTransport): NegotiatedSession {
+    private suspend fun negotiateOn(transport: XmppTransport, resume: ResumeRequest?): NegotiatedSession {
         val reader = StanzaReader(transport, config, logger)
 
         var features = reader.openStream(from = null)
@@ -143,6 +163,28 @@ public class StreamNegotiator(
         reader.restart()
         val postAuth = reader.openStream(from = config.jid.toString())
 
+        val smOffered = postAuth.child("sm", Ns.SM) != null
+        val previous = resume?.streamManagement
+        if (resume != null && previous != null && smOffered && previous.canResume) {
+            if (tryResume(reader, previous)) {
+                return NegotiatedSession(
+                    jid = resume.jid,
+                    transport = transport,
+                    tls = tls,
+                    saslMechanism = mechanism.name,
+                    scramKeys = (mechanism as? ScramMechanism)?.derivedKeys,
+                    channelBound = mechanism.usesChannelBinding,
+                    capabilities = resume.capabilities,
+                    featuresBeforeTls = featuresBeforeTls,
+                    featuresAfterTls = featuresAfterTls,
+                    streamManagement = previous,
+                    resumed = true,
+                    carryOver = previous,
+                    reader = reader,
+                )
+            }
+        }
+
         val jid = bind(reader, postAuth)
         establishLegacySessionIfRequired(reader, postAuth)
         val capabilities = ServerCapabilities(
@@ -150,6 +192,8 @@ public class StreamNegotiator(
             server = discoInfo(reader, domain),
             account = discoInfo(reader, jid.bare.toString()),
         )
+        // Capability gate: SM only when the server advertised it on this stream.
+        val sm = if (smOffered) enableStreamManagement(reader) else null
         return NegotiatedSession(
             jid = jid,
             transport = transport,
@@ -160,8 +204,66 @@ public class StreamNegotiator(
             capabilities = capabilities,
             featuresBeforeTls = featuresBeforeTls,
             featuresAfterTls = featuresAfterTls,
+            streamManagement = sm,
+            resumed = false,
+            carryOver = previous,
             reader = reader,
         )
+    }
+
+    /**
+     * Sends `<resume/>` and applies the server's `h` to [previous]. Returns true
+     * when resumed, false when the server refused and a fresh bind is needed.
+     */
+    private suspend fun tryResume(reader: StanzaReader, previous: StreamManagement): Boolean {
+        reader.send(
+            element("resume", Ns.SM) {
+                attribute("h", previous.inbound.toString())
+                attribute("previd", previous.resumptionId)
+            },
+        )
+        val answer = reader.nextNonza()
+        if (answer.namespace != Ns.SM) throw XmppNegotiationException(NegotiationFailure.PROTOCOL, "Unexpected <${answer.name}/> after <resume/>")
+        return when (answer.name) {
+            "resumed" -> {
+                val h = StreamManagement.parseH(answer.attribute("h"))
+                    ?: throw XmppNegotiationException(NegotiationFailure.PROTOCOL, "<resumed/> without a valid h")
+                if (!previous.onAck(h)) {
+                    throw XmppNegotiationException(NegotiationFailure.PROTOCOL, "Server acknowledged more stanzas than were sent")
+                }
+                true
+            }
+            "failed" -> {
+                // The server may still say how much it received (XEP-0198 §5), which avoids duplicates.
+                StreamManagement.parseH(answer.attribute("h"))?.let { previous.onAck(it) }
+                false
+            }
+            else -> throw XmppNegotiationException(NegotiationFailure.PROTOCOL, "Unexpected <${answer.name}/> after <resume/>")
+        }
+    }
+
+    /** XEP-0198 §3. A refusal is not an error: the session simply runs without SM. */
+    private suspend fun enableStreamManagement(reader: StanzaReader): StreamManagement? {
+        reader.send(element("enable", Ns.SM) { attribute("resume", "true") })
+        while (true) {
+            val answer = reader.nextNonza()
+            if (answer.namespace != Ns.SM) {
+                reader.unclaimed(answer) // A stanza that arrived first; not counted, as SM is not on yet.
+                continue
+            }
+            return when (answer.name) {
+                "enabled" -> {
+                    val resumable = answer.attribute("resume").let { it == "true" || it == "1" }
+                    StreamManagement(
+                        resumptionId = answer.attribute("id")?.takeIf { resumable && it.isNotEmpty() },
+                        location = answer.attribute("location"),
+                        maxResumeSeconds = answer.attribute("max")?.toIntOrNull()?.takeIf { it > 0 },
+                    )
+                }
+                "failed" -> null
+                else -> throw XmppNegotiationException(NegotiationFailure.PROTOCOL, "Unexpected <${answer.name}/> after <enable/>")
+            }
+        }
     }
 
     private suspend fun authenticate(reader: StanzaReader, transport: XmppTransport, features: Element): SaslMechanism {
@@ -269,6 +371,7 @@ internal class StanzaReader(
 ) : XmppStreamHandler {
     private val parser = XmppStreamParser(this, config.xmlLimits)
     private val events = ArrayDeque<Any>()
+    private val skipped = ArrayDeque<Element>()
     private val buffer = ByteArray(16 * 1024)
     private var iqCounter = 0
     private val idPrefix = Base64.UrlSafe.encode(Crypto.randomBytes(6))
@@ -349,7 +452,10 @@ internal class StanzaReader(
         )
         while (true) {
             val reply = nextNonza()
-            if (reply.name != "iq" || reply.namespace != Ns.CLIENT || reply.attribute("id") != id) continue
+            if (reply.name != "iq" || reply.namespace != Ns.CLIENT || reply.attribute("id") != id) {
+                unclaimed(reply)
+                continue
+            }
             when (reply.attribute("type")) {
                 "result" -> return reply
                 "error" -> throw IqErrorException(
@@ -358,6 +464,31 @@ internal class StanzaReader(
                 else -> throw XmppNegotiationException(NegotiationFailure.PROTOCOL, "Invalid IQ response type")
             }
         }
+    }
+
+    /** Keeps a stanza that arrived while negotiation waited for something else, for the session to deliver. */
+    fun unclaimed(element: Element) {
+        if (StreamManagement.isStanza(element)) skipped.addLast(element)
+    }
+
+    /** Stanzas kept by [unclaimed], in arrival order. */
+    fun takeUnclaimed(): List<Element> = skipped.toList().also { skipped.clear() }
+
+    /**
+     * Next element on a live session, with no timeout (liveness is the supervisor's
+     * probe). Returns null when the server closes the stream; a stream error throws.
+     */
+    suspend fun nextLive(): Element? {
+        while (events.isEmpty()) {
+            val n = transport.read(buffer)
+            if (n < 0) throw XmppNegotiationException(NegotiationFailure.CONNECTION_LOST, "Server closed the connection")
+            parser.feed(buffer, 0, n)
+        }
+        if (events.first() === StreamClosed) {
+            events.removeFirst()
+            return null
+        }
+        return nextNonza()
     }
 
     /**

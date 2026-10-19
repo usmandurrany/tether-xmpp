@@ -66,6 +66,14 @@ internal class FakeXmppServer(
     val streamErrorAfterAuth: String? = null,
     val requireSession: Boolean = false,
     val bindJid: String = "juliet@localhost/phone",
+    /** Advertise XEP-0198 after login. */
+    val streamManagement: Boolean = false,
+    /** Accept `<resume/>` for the id this server handed out. */
+    @Volatile var allowResume: Boolean = true,
+    /** Ignore `<r/>` and pings, like a server that has silently gone away. */
+    @Volatile var silent: Boolean = false,
+    /** Pretend this many of the client's last stanzas were lost in transit when it resumes. */
+    @Volatile var lostInTransit: Int = 0,
 ) : AutoCloseable {
     private val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
     val port: Int get() = server.localPort
@@ -75,20 +83,52 @@ internal class FakeXmppServer(
     @Volatile var usedMechanism: String? = null
     @Volatile var usedGs2Header: String? = null
 
+    /** Stanzas the client sent after login, in order. */
+    val fromClient = LinkedBlockingQueue<Element>()
+    /** `h` values from the client's `<a/>` answers. */
+    val clientAcks = LinkedBlockingQueue<Long>()
+    @Volatile var connections = 0
+    @Volatile var resumes = 0
+
+    // Server-side SM state; survives a dropped connection, as on a real server.
+    @Volatile private var smInbound = 0L
+    @Volatile private var current: Conn? = null
+    private val smId = "sm-${System.nanoTime()}"
+
     private val worker = thread(isDaemon = true, name = "fake-xmpp") {
-        try {
-            server.accept().use { serve(it) }
-        } catch (t: Throwable) {
-            if (!server.isClosed) failures += t
+        while (!server.isClosed) {
+            try {
+                server.accept().use {
+                    connections++
+                    serve(it)
+                }
+            } catch (t: Throwable) {
+                if (!server.isClosed && current?.dropped != true) failures += t
+            }
+        }
+    }
+
+    /** Sends raw XML to the connected client. */
+    fun push(xml: String) {
+        current!!.send(xml)
+    }
+
+    /** Cuts the TCP connection without a stream close, like a dead mobile link. */
+    fun dropConnection() {
+        current?.let {
+            it.dropped = true
+            it.socket.close()
         }
     }
 
     override fun close() {
         server.close()
+        current?.socket?.close()
         worker.join(5000)
     }
 
     private class Conn(var socket: Socket) {
+        @Volatile var dropped = false
         var input: InputStream = socket.getInputStream()
         var output: OutputStream = socket.getOutputStream()
         val events = LinkedBlockingQueue<Any>()
@@ -125,6 +165,7 @@ internal class FakeXmppServer(
 
     private fun serve(socket: Socket) {
         val c = Conn(socket)
+        current = c
         // Stream 1: plaintext.
         check(c.next() is StreamHeader)
         c.send(header())
@@ -171,16 +212,41 @@ internal class FakeXmppServer(
             return
         }
         val session = if (requireSession) "<session xmlns='urn:ietf:params:xml:ns:xmpp-session'/>" else ""
-        c.send("<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>$session<sm xmlns='urn:xmpp:sm:3'/><csi xmlns='urn:xmpp:csi:0'/></stream:features>")
+        val sm = if (streamManagement) "<sm xmlns='urn:xmpp:sm:3'/>" else ""
+        c.send("<stream:features><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>$session$sm<csi xmlns='urn:xmpp:csi:0'/></stream:features>")
+        var smOn = false
         while (true) {
-            val iq = (c.next() as? Element) ?: return
-            val id = iq.attribute("id")
+            val el = (c.next() as? Element) ?: return
+            val id = el.attribute("id")
+            if (el.namespace == "urn:xmpp:sm:3") {
+                when (el.name) {
+                    "enable" -> {
+                        smOn = true
+                        smInbound = 0
+                        c.send("<enabled xmlns='urn:xmpp:sm:3' id='$smId' resume='true' max='300'/>")
+                    }
+                    "resume" -> if (allowResume && el.attribute("previd") == smId) {
+                        smInbound -= lostInTransit
+                        smOn = true
+                        resumes++
+                        c.send("<resumed xmlns='urn:xmpp:sm:3' previd='$smId' h='$smInbound'/>")
+                    } else {
+                        smInbound -= lostInTransit
+                        c.send("<failed xmlns='urn:xmpp:sm:3' h='$smInbound'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></failed>")
+                    }
+                    "r" -> if (!silent) c.send("<a xmlns='urn:xmpp:sm:3' h='$smInbound'/>")
+                    "a" -> clientAcks += el.attribute("h")!!.toLong()
+                }
+                continue
+            }
+            if (smOn) smInbound++
             when {
-                iq.child("bind", "urn:ietf:params:xml:ns:xmpp-bind") != null ->
+                el.child("bind", "urn:ietf:params:xml:ns:xmpp-bind") != null ->
                     c.send("<iq type='result' id='$id'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><jid>$bindJid</jid></bind></iq>")
-                iq.child("session", "urn:ietf:params:xml:ns:xmpp-session") != null -> c.send("<iq type='result' id='$id'/>")
-                iq.attribute("to") == "localhost" -> {
-                    // An unrelated stanza first, which the client must skip.
+                el.child("session", "urn:ietf:params:xml:ns:xmpp-session") != null -> c.send("<iq type='result' id='$id'/>")
+                el.child("ping", "urn:xmpp:ping") != null -> if (!silent) c.send("<iq type='result' id='$id' from='localhost'/>")
+                el.name == "iq" && el.child("query", "http://jabber.org/protocol/disco#info") != null && el.attribute("to") == "localhost" -> {
+                    // An unrelated stanza first, which the client must keep for the app.
                     c.send("<message from='localhost'><body>welcome</body></message>")
                     c.send(
                         "<iq type='result' id='$id' from='localhost'><query xmlns='http://jabber.org/protocol/disco#info'>" +
@@ -188,12 +254,13 @@ internal class FakeXmppServer(
                             "<feature var='urn:xmpp:ping'/></query></iq>",
                     )
                 }
-                iq.attribute("to") == "juliet@localhost" ->
+                el.name == "iq" && el.attribute("to") == "juliet@localhost" ->
                     c.send(
                         "<iq type='error' id='$id' from='juliet@localhost'><error type='cancel'>" +
                             "<service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>",
                     )
-                else -> error("unexpected $iq")
+                el.name == "iq" && el.attribute("type") == "result" -> fromClient += el
+                else -> fromClient += el
             }
         }
     }
