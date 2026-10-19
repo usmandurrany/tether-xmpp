@@ -1,6 +1,6 @@
 # KMP XMPP SDK: Foundation, Authentication and Reconnection Design
 
-Status: proposal v2 (2026-10-19), revised after Usman's review. Development server: **MongooseIM 6.8.0** on Usman's network. Minimum Android: **API 26**. Targets now: **Android** and the **JVM**, which covers Linux and Windows desktops. Native Linux and Windows targets were dropped (2026-10-19): the JVM is enough there. Kept reachable: iOS, macOS, Web.
+Status: proposal v2 (2026-10-19), revised after Usman's review. Development server: **MongooseIM 6.8.0** on Usman's network. Minimum Android: **API 26**. Targets now: **Android** and the **JVM**, which covers every desktop (Linux, Windows, macOS). Native desktop targets (Linux, Windows, macOS) were dropped (2026-10-19): the JVM is enough there. Kept reachable: iOS, Web.
 
 ---
 
@@ -39,7 +39,7 @@ We considered `xmlutil` (pdvrieze, KMP). Its strength is serialization and it re
 
 ## 2. Module layout
 
-All modules are Kotlin Multiplatform; platform code lives in `jvmMain` and `androidMain` (later `appleMain`, `jsMain`/`wasmJsMain`).
+All modules are Kotlin Multiplatform; platform code lives in `jvmMain` and `androidMain` (later `iosMain`, `jsMain`/`wasmJsMain`).
 
 ```
 tether-xml            Streaming parser, writer, immutable Element model. No other deps.
@@ -77,7 +77,7 @@ Public API is UI-agnostic: `XmppClient` exposes `state: StateFlow<ConnectionStat
 
 Per-platform TLS (expect/actual):
 - JVM / Android: `SSLEngine` over NIO (Android uses its Conscrypt provider). Exposes the `tls-exporter` and `tls-server-end-point` channel-binding data.
-- Apple (later): Network.framework `NWConnection`.
+- iOS (later): Network.framework `NWConnection`.
 - Web (later): WebSocket only (`wss://`), browser does TLS; no channel binding available there.
 
 ### 3.2 SASL mechanisms and policy
@@ -129,7 +129,7 @@ On MongooseIM 6.8.0 the first Phase 1 task is a capability probe that logs all o
 
 ### 3.6 Crypto primitives
 
-SHA-1/256/512, HMAC, PBKDF2 (Hi), CSPRNG behind an expect/actual `Crypto` object: JCA on JVM/Android, CommonCrypto on Apple, WebCrypto on JS. No third-party crypto library in common code.
+SHA-1/256/512, HMAC, PBKDF2 (Hi), CSPRNG behind an expect/actual `Crypto` object: JCA on JVM/Android, CommonCrypto on iOS, WebCrypto on JS. No third-party crypto library in common code.
 
 ---
 
@@ -269,7 +269,7 @@ E2EE (OMEMO, XEP-0384, as the primary target; OpenPGP for XMPP, XEP-0373, and ML
 | 1 | `tether-transport` TCP/TLS on JVM/Android, `tether-dns`, `tether-sasl` (SCRAM + PLUS + downgrade protection + optional PLAIN), classic bind, capability discovery. First deliverable: a capability probe run against MongooseIM 6.8.0. |
 | 2 | State machine with the single-connection guarantee, SM with resumption, adaptive keepalive, backoff, network monitors (Android + Linux JVM). Property-based and chaos test suites green. |
 | 3 | SASL2 + Bind2 + FAST (if MongooseIM advertises them), credential stores, CSI, Carbons, PEP/PubSub, MAM catch-up, generic push + FCM module. |
-| 4 | Apple targets, WebSocket transport for Web. (Native Linux and Windows dropped: the JVM covers both.) |
+| 4 | iOS, WebSocket transport for Web. (Native desktop targets dropped: the JVM covers Linux, Windows and macOS.) |
 
 Review process: code arrives as small pull requests, one logical piece each (for example "XML parser", "SCRAM", "connection actor"). Each PR description explains the logic, the invariants it relies on and how it is tested. Nothing is merged without Usman's review.
 
