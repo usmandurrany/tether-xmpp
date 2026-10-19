@@ -19,3 +19,5 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y -q libssl-dev
       - name: Build and test (JVM and Linux native)
         run: ./gradlew check --stacktrace
+      - name: Publish to the local Maven repository
+        run: ./gradlew publishToMavenLocal --stacktrace

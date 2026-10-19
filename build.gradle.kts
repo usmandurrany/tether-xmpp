@@ -19,3 +19,9 @@ allprojects {
     group = "io.github.usmandurrany.tether"
     version = "0.1.0-SNAPSHOT"
 }
+
+// Library modules publish to a Maven repository (`./gradlew publishToMavenLocal`
+// for local use), so apps can depend on them by coordinates.
+subprojects {
+    plugins.withId("org.jetbrains.kotlin.multiplatform") { apply(plugin = "maven-publish") }
+}

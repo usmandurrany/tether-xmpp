@@ -6,6 +6,8 @@ First targets: **Android (API 26+)** and **Linux (JVM, then Kotlin/Native)**. iO
 
 Status: early development. See [docs/design.md](docs/design.md) for the architecture and roadmap.
 
+To add Tether to an app, see [docs/integration.md](docs/integration.md).
+
 ## Probing a server
 
 `tools/probe` connects to any XMPP server, logs in, and prints what the server advertises: stream features at each stage, SASL mechanisms, channel-binding types, and disco#info for the server and your account. It only uses standard RFC 6120 and XEP-0030 discovery, so it works on any compliant server.
