@@ -15,9 +15,7 @@ jobs:
           distribution: temurin
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
-      - name: OpenSSL headers for the Linux native transport
-        run: sudo apt-get update -q && sudo apt-get install -y -q libssl-dev
-      - name: Build and test (JVM and Linux native)
+      - name: Build and test
         run: ./gradlew check --stacktrace
       - name: Publish to the local Maven repository
         run: ./gradlew publishToMavenLocal --stacktrace

@@ -1,6 +1,6 @@
 # KMP XMPP SDK: Foundation, Authentication and Reconnection Design
 
-Status: proposal v2 (2026-10-19), revised after Usman's review. Development server: **MongooseIM 6.8.0** on Usman's network. Minimum Android: **API 26**. Targets now: **Android** and **Linux (JVM first, Kotlin/Native `linuxX64` second)**. Kept reachable: iOS, macOS, Windows, Web.
+Status: proposal v2 (2026-10-19), revised after Usman's review. Development server: **MongooseIM 6.8.0** on Usman's network. Minimum Android: **API 26**. Targets now: **Android** and the **JVM**, which covers Linux and Windows desktops. Native Linux and Windows targets were dropped (2026-10-19): the JVM is enough there. Kept reachable: iOS, macOS, Web.
 
 ---
 
@@ -29,7 +29,7 @@ Parser requirements:
 - **Namespace aware**, with prefix scoping.
 - **Hard limits** (configurable, safe defaults): max stanza size 256 KiB, max depth 32, max attributes per element 64, max attribute value 64 KiB, max namespace declarations per element 16. Exceeding a limit closes the stream with `<policy-violation/>`.
 - Any DTD, PI, comment, undeclared entity → `<restricted-xml/>` stream error, disconnect.
-- Fuzzed in CI (Jazzer on JVM, plus a corpus replayed on native).
+- Fuzzed in CI (Jazzer on JVM).
 
 Writer: escapes text and attributes, never emits unescaped user input, builds stanzas from an immutable element tree.
 
@@ -39,7 +39,7 @@ We considered `xmlutil` (pdvrieze, KMP). Its strength is serialization and it re
 
 ## 2. Module layout
 
-All modules are Kotlin Multiplatform; platform code lives in `jvmMain`, `androidMain`, `linuxX64Main` (later `appleMain`, `mingwMain`, `jsMain`/`wasmJsMain`).
+All modules are Kotlin Multiplatform; platform code lives in `jvmMain` and `androidMain` (later `appleMain`, `jsMain`/`wasmJsMain`).
 
 ```
 tether-xml            Streaming parser, writer, immutable Element model. No other deps.
@@ -77,7 +77,6 @@ Public API is UI-agnostic: `XmppClient` exposes `state: StateFlow<ConnectionStat
 
 Per-platform TLS (expect/actual):
 - JVM / Android: `SSLEngine` over NIO (Android uses its Conscrypt provider). Exposes the `tls-exporter` and `tls-server-end-point` channel-binding data.
-- Linux native (phase 2): OpenSSL via cinterop.
 - Apple (later): Network.framework `NWConnection`.
 - Web (later): WebSocket only (`wss://`), browser does TLS; no channel binding available there.
 
@@ -130,7 +129,7 @@ On MongooseIM 6.8.0 the first Phase 1 task is a capability probe that logs all o
 
 ### 3.6 Crypto primitives
 
-SHA-1/256/512, HMAC, PBKDF2 (Hi), CSPRNG behind an expect/actual `Crypto` object: JCA on JVM/Android, OpenSSL on Linux native, CommonCrypto on Apple, WebCrypto on JS. No third-party crypto library in common code.
+SHA-1/256/512, HMAC, PBKDF2 (Hi), CSPRNG behind an expect/actual `Crypto` object: JCA on JVM/Android, CommonCrypto on Apple, WebCrypto on JS. No third-party crypto library in common code.
 
 ---
 
@@ -208,9 +207,9 @@ TCP alone can take many minutes to notice a dead mobile link. We detect it activ
 - `ConnectivityManager.NetworkCallback` drives reconnects; socket bound to the active `Network` so traffic does not leak onto a dying interface.
 - `AlarmManager`-based keepalive is avoided (inexact in Doze); keepalive runs only while the process is active, push covers the rest.
 
-**Linux (JVM and native)**
+**Desktop JVM (Linux, Windows)**
 - No background killing, so persistent connection is the norm.
-- Network changes via NetworkManager D-Bus signals when present, else netlink route/address events (native) or periodic interface polling (JVM fallback).
+- Network changes via NetworkManager D-Bus signals when present, else periodic interface polling.
 - System sleep/resume detected (logind `PrepareForSleep` signal when available, else a monotonic vs. wall-clock jump detector) → immediate liveness probe on wake.
 
 ### 4.6 Outgoing message guarantees
@@ -266,11 +265,11 @@ E2EE (OMEMO, XEP-0384, as the primary target; OpenPGP for XMPP, XEP-0373, and ML
 
 | Phase | Deliverable |
 |---|---|
-| 0 | Gradle KMP skeleton (JVM, Android, linuxX64 targets declared), CI, lint, `tether-xml` parser + fuzzing. |
+| 0 | Gradle KMP skeleton (JVM and Android targets declared), CI, lint, `tether-xml` parser + fuzzing. |
 | 1 | `tether-transport` TCP/TLS on JVM/Android, `tether-dns`, `tether-sasl` (SCRAM + PLUS + downgrade protection + optional PLAIN), classic bind, capability discovery. First deliverable: a capability probe run against MongooseIM 6.8.0. |
 | 2 | State machine with the single-connection guarantee, SM with resumption, adaptive keepalive, backoff, network monitors (Android + Linux JVM). Property-based and chaos test suites green. |
 | 3 | SASL2 + Bind2 + FAST (if MongooseIM advertises them), credential stores, CSI, Carbons, PEP/PubSub, MAM catch-up, generic push + FCM module. |
-| 4 | Kotlin/Native `linuxX64` (OpenSSL TLS + crypto), then Apple, Windows, WebSocket transport for Web. |
+| 4 | Apple targets, WebSocket transport for Web. (Native Linux and Windows dropped: the JVM covers both.) |
 
 Review process: code arrives as small pull requests, one logical piece each (for example "XML parser", "SCRAM", "connection actor"). Each PR description explains the logic, the invariants it relies on and how it is tested. Nothing is merged without Usman's review.
 
