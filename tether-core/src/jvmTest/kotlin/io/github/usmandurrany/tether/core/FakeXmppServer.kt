@@ -7,6 +7,7 @@ import io.github.usmandurrany.tether.xml.Element
 import io.github.usmandurrany.tether.xml.StreamHeader
 import io.github.usmandurrany.tether.xml.XmppStreamHandler
 import io.github.usmandurrany.tether.xml.XmppStreamParser
+import org.conscrypt.Conscrypt
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
@@ -49,6 +50,12 @@ internal object TestCertificate {
         kmf.init(keyStore, "changeit".toCharArray())
         SSLContext.getInstance("TLS").apply { init(kmf.keyManagers, null, null) }
     }
+
+    val conscryptContext: SSLContext by lazy {
+        val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
+        kmf.init(keyStore, "changeit".toCharArray())
+        SSLContext.getInstance("TLS", Conscrypt.newProvider()).apply { init(kmf.keyManagers, null, null) }
+    }
 }
 
 /**
@@ -74,6 +81,8 @@ internal class FakeXmppServer(
     @Volatile var silent: Boolean = false,
     /** Pretend this many of the client's last stanzas were lost in transit when it resumes. */
     @Volatile var lostInTransit: Int = 0,
+    /** Serve TLS through Conscrypt and offer `tls-exporter` channel binding. */
+    val conscrypt: Boolean = false,
 ) : AutoCloseable {
     private val server = ServerSocket(0, 1, InetAddress.getLoopbackAddress())
     val port: Int get() = server.localPort
@@ -131,6 +140,7 @@ internal class FakeXmppServer(
 
     private class Conn(var socket: Socket) {
         @Volatile var dropped = false
+        var ssl: SSLSocket? = null
         var input: InputStream = socket.getInputStream()
         var output: OutputStream = socket.getOutputStream()
         val events = LinkedBlockingQueue<Any>()
@@ -179,12 +189,12 @@ internal class FakeXmppServer(
         c.send("<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>")
         check(c.element().name == "starttls")
         c.send("<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")
-        val ssl = TestCertificate.sslContext.socketFactory.let {
-            (TestCertificate.sslContext.socketFactory.createSocket(socket, null, socket.port, true) as SSLSocket)
-        }
+        val context = if (conscrypt) TestCertificate.conscryptContext else TestCertificate.sslContext
+        val ssl = context.socketFactory.createSocket(socket, null, socket.port, true) as SSLSocket
         ssl.useClientMode = false
         ssl.startHandshake()
         c.socket = ssl
+        c.ssl = ssl
         c.input = ssl.inputStream
         c.output = ssl.outputStream
         c.restart()
@@ -193,7 +203,8 @@ internal class FakeXmppServer(
         check(c.next() is StreamHeader)
         c.send(header())
         val mechs = mechanisms.joinToString("") { "<mechanism>$it</mechanism>" }
-        val cb = if (advertiseChannelBinding) "<sasl-channel-binding xmlns='urn:xmpp:sasl-cb:0'><channel-binding type='tls-server-end-point'/></sasl-channel-binding>" else ""
+        val types = if (conscrypt) "<channel-binding type='tls-exporter'/><channel-binding type='tls-server-end-point'/>" else "<channel-binding type='tls-server-end-point'/>"
+        val cb = if (advertiseChannelBinding) "<sasl-channel-binding xmlns='urn:xmpp:sasl-cb:0'>$types</sasl-channel-binding>" else ""
         c.send("<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>$mechs</mechanisms>$cb</stream:features>")
         val auth = c.element()
         check(auth.name == "auth")
@@ -290,7 +301,11 @@ internal class FakeXmppServer(
         val final = Base64.Default.decode(c.element().text).decodeToString()
         val withoutProof = final.substringBefore(",p=")
         val cbData = Base64.Default.decode(withoutProof.substringAfter("c=").substringBefore(","))
-        val expectedBinding = if (gs2.startsWith("p=tls-server-end-point")) MessageDigest.getInstance("SHA-256").digest(TestCertificate.der) else ByteArray(0)
+        val expectedBinding = when {
+            gs2.startsWith("p=tls-server-end-point") -> MessageDigest.getInstance("SHA-256").digest(TestCertificate.der)
+            gs2.startsWith("p=tls-exporter") -> Conscrypt.exportKeyingMaterial(c.ssl!!, "EXPORTER-Channel-Binding", null, 32)
+            else -> ByteArray(0)
+        }
         check(cbData.contentEquals(gs2.encodeToByteArray() + expectedBinding)) { "channel binding mismatch" }
 
         val h = HashAlgorithm.SHA256
