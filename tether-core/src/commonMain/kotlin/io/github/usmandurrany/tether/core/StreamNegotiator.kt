@@ -423,6 +423,12 @@ internal class StanzaReader(
         transport.write(XmlWriter.toXml(element, inheritedNamespace = Ns.CLIENT).encodeToByteArray())
     }
 
+    /** Ends our side of the XML stream (RFC 6120 §4.4). */
+    suspend fun sendStreamClose() {
+        logger?.sent("</stream:stream>")
+        transport.write("</stream:stream>".encodeToByteArray())
+    }
+
     /** Next top-level element, turning `<stream:error/>` and stream close into exceptions. */
     suspend fun nextNonza(): Element {
         val event = next()

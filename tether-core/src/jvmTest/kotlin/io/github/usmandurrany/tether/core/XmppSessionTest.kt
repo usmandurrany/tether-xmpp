@@ -164,6 +164,22 @@ class XmppSessionTest {
     }
 
     @Test
+    fun gracefulCloseFlushesEndsTheStreamAndCannotBeResumed() = runBlocking<Unit> {
+        val fake = FakeXmppServer(streamManagement = true)
+        val opener = opener(fake)
+        val first = opener.live()
+        first.send(message("bye", id = "last"))
+        assertEquals("last", fake.nextFromClient().attribute("id"))
+        withTimeout(10_000) { first.closeGracefully() }
+        assertTrue(fake.clientClosedStream, "</stream:stream> was sent")
+        assertTrue(first.streamManagement!!.pending.isEmpty(), "unconfirmed stanzas were flushed first")
+
+        val second = opener.live()
+        assertFalse(second.resumed, "the server ended the session, so the next login is fresh")
+        assertNull(fake.fromClient.poll(300, TimeUnit.MILLISECONDS)?.takeIf { it.attribute("id") == "last" }, "nothing re-sent")
+    }
+
+    @Test
     fun withoutStreamManagementTheProbeIsAPing() = runBlocking<Unit> {
         val fake = FakeXmppServer(streamManagement = false)
         val session = opener(fake).live()

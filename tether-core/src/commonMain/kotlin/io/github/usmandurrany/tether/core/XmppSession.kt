@@ -158,6 +158,27 @@ public class XmppSession private constructor(
         }
     }
 
+    /**
+     * Ends the session cleanly: with SM, first asks the server to confirm what
+     * is still unconfirmed, then sends `</stream:stream>` and waits briefly for
+     * the server's own close. The server then treats the account as offline at
+     * once (RFC 6120 §4.4), which is what routes new messages to push.
+     * Stanzas still unconfirmed stay queued for the next session.
+     */
+    override suspend fun closeGracefully() {
+        if (closed) return
+        try {
+            if (sm != null && lock.withLock { sm.unackedCount } > 0) {
+                withTimeoutOrNull(2_000) { probe() }
+            }
+            lock.withLock { if (!closed) reader.sendStreamClose() }
+            // The server answers with its own </stream:stream>; the read loop then ends.
+            if (loopStarted) withTimeoutOrNull(2_000) { ended.await() }
+        } finally {
+            close()
+        }
+    }
+
     /** Waits (bounded) until reading has stopped, so the SM state is final. */
     internal suspend fun awaitEnded(timeoutMillis: Long) {
         withTimeoutOrNull(timeoutMillis) { ended.await() }
