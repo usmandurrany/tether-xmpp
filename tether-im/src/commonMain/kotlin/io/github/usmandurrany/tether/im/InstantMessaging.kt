@@ -2,7 +2,9 @@ package io.github.usmandurrany.tether.im
 
 import io.github.usmandurrany.tether.core.ClientExtension
 import io.github.usmandurrany.tether.core.SessionContext
+import io.github.usmandurrany.tether.core.StanzaSender
 import io.github.usmandurrany.tether.core.XmppClient
+import io.github.usmandurrany.tether.xml.Element
 import io.github.usmandurrany.tether.xml.element
 
 /**
@@ -51,6 +53,12 @@ public data class ChatFeatures(
      * or [TetherChat.deny]. Needs [presence].
      */
     val autoAcceptContacts: Boolean = false,
+    /**
+     * Profiles and profile pictures (XEP-0054 vCard, XEP-0153): our own with
+     * [TetherChat.myProfile] and [TetherChat.updateMyProfile], contacts' on
+     * [TetherChat.contacts], [TetherChat.conversations] and [TetherChat.profile].
+     */
+    val profiles: Boolean = true,
 )
 
 /**
@@ -92,11 +100,19 @@ public class InstantMessaging(
     public val history: History = History(client)
     public val push: Push = Push(client)
     public val lastActivity: LastActivity = LastActivity(client)
+    public val profiles: Profiles = Profiles(client)
 
     init {
         if (features.contacts) client.install(roster)
         if (features.multiDevice) client.install(carbons)
-        client.install(if (features.presence) presences else Availability(presence))
+        val availability = Availability(client, presence)
+        if (features.profiles) {
+            presences.decorate = profiles::presenceUpdate
+            availability.decorate = profiles::presenceUpdate
+            profiles.reannounce = if (features.presence) presences::reannounce else availability::reannounce
+            client.install(profiles) // before presence, so the first one carries our picture's hash
+        }
+        client.install(if (features.presence) presences else availability)
         client.install(messaging)
         if (features.history) client.install(history)
         client.install(push)
@@ -104,15 +120,22 @@ public class InstantMessaging(
 }
 
 /** Goes online on each new session without tracking anyone else's presence. */
-private class Availability(private val own: OwnPresence) : ClientExtension {
+private class Availability(private val client: StanzaSender, private val own: OwnPresence) : ClientExtension {
+    var decorate: (() -> Element?)? = null
+
     override suspend fun onSessionStarted(session: SessionContext) {
         if (session.resumed) return
-        session.send(
-            element("presence", ImNs.CLIENT) {
-                own.show?.let { element("show") { text(it.wire) } }
-                own.status?.let { element("status") { text(it) } }
-                if (own.priority != 0) element("priority") { text(own.priority.toString()) }
-            },
-        )
+        session.send(stanza())
+    }
+
+    suspend fun reannounce() {
+        client.send(stanza())
+    }
+
+    private fun stanza(): Element = element("presence", ImNs.CLIENT) {
+        own.show?.let { element("show") { text(it.wire) } }
+        own.status?.let { element("status") { text(it) } }
+        if (own.priority != 0) element("priority") { text(own.priority.toString()) }
+        decorate?.invoke()?.let { child(it) }
     }
 }

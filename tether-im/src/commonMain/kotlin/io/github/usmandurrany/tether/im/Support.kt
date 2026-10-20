@@ -25,6 +25,8 @@ internal object ImNs {
     const val RETRACT = "urn:xmpp:message-retract:1"
     const val FALLBACK = "urn:xmpp:fallback:0"
     const val LAST = "jabber:iq:last"
+    const val VCARD = "vcard-temp"
+    const val VCARD_UPDATE = "vcard-temp:x:update"
 }
 
 /** The bare part of an address from the wire, or null when it is missing or malformed. */

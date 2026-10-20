@@ -100,7 +100,7 @@ public data class Message(
 /** One entry of the chat list. */
 public data class Conversation(
     val peer: BareJid,
-    /** The contact's name, or the user part of their address. */
+    /** The name we gave them, else the one in their profile, else the user part of their address. */
     val name: String,
     val lastMessage: Message?,
     val unreadCount: Int,
@@ -109,12 +109,14 @@ public data class Conversation(
     val online: Boolean,
     /** When the contact was last online, in milliseconds since the epoch; null while online or when unknown. */
     val lastSeen: Long? = null,
+    /** Their profile picture, once fetched. */
+    val avatar: Avatar? = null,
 )
 
 /** One entry of the contact list, with what we know of their presence. */
 public data class Contact(
     val jid: BareJid,
-    /** The name we gave them, or the user part of their address. */
+    /** The name we gave them, else the one in their profile, else the user part of their address. */
     val name: String,
     val online: Boolean,
     /** Away, busy and so on, from their most important online device; null when plainly available. */
@@ -127,6 +129,8 @@ public data class Contact(
     val groups: Set<String>,
     /** When they were last online, in milliseconds since the epoch; null while online or when unknown. */
     val lastSeen: Long? = null,
+    /** Their profile picture, once fetched. */
+    val avatar: Avatar? = null,
 )
 
 /**
@@ -241,22 +245,28 @@ public class TetherChat(
             (asked.keys + watched.keys).associateWith { maxOf(asked[it] ?: 0, watched[it] ?: 0) }
         }.stateIn(scope, SharingStarted.Eagerly, emptyMap())
 
+    /** Roster entries and fetched profiles, which together give names and pictures. */
+    private val people: StateFlow<Pair<Map<BareJid, RosterItem>, Map<BareJid, Profile>>> =
+        combine(im.roster.items, im.profiles.known) { roster, profiles -> roster to profiles }
+            .stateIn(scope, SharingStarted.Eagerly, im.roster.items.value to im.profiles.known.value)
+
     /** Contacts typing right now. */
     public val typingContacts: StateFlow<Set<BareJid>> =
         typingTokens.map { it.keys }.distinctUntilChanged().stateIn(scope, SharingStarted.Eagerly, emptySet())
 
     /** The chat list, most recent first. */
     public val conversations: StateFlow<List<Conversation>> =
-        combine(allMessages, typingContacts, im.roster.items, im.presences.contacts, lastSeenTimes) { all, typing, roster, online, seen ->
+        combine(allMessages, typingContacts, people, im.presences.contacts, lastSeenTimes) { all, typing, (roster, profiles), online, seen ->
             all.filterValues { it.isNotEmpty() }.map { (peer, messages) ->
                 Conversation(
                     peer = peer,
-                    name = displayName(peer, roster[peer]?.name),
+                    name = displayName(peer, roster[peer]?.name, profiles[peer]),
                     lastMessage = messages.lastOrNull(),
                     unreadCount = messages.count { it.status == MessageStatus.UNREAD },
                     typing = peer in typing,
                     online = !online[peer].isNullOrEmpty(),
                     lastSeen = if (features.lastSeen && online[peer].isNullOrEmpty()) seen[peer] else null,
+                    avatar = profiles[peer]?.avatar,
                 )
             }.sortedByDescending { it.lastMessage?.timestamp ?: 0 }
         }.stateIn(scope, SharingStarted.Eagerly, emptyList())
@@ -268,12 +278,12 @@ public class TetherChat(
 
     /** The contact list, sorted by name. Empty when [ChatFeatures.contacts] is off. */
     public val contacts: StateFlow<List<Contact>> =
-        combine(im.roster.items, im.presences.contacts, lastSeenTimes) { roster, online, seen ->
+        combine(people, im.presences.contacts, lastSeenTimes) { (roster, profiles), online, seen ->
             roster.values.map { item ->
                 val best = online[item.jid].orEmpty().maxByOrNull { it.priority }
                 Contact(
                     jid = item.jid,
-                    name = displayName(item.jid, item.name),
+                    name = displayName(item.jid, item.name, profiles[item.jid]),
                     online = best != null,
                     show = best?.show,
                     status = best?.status,
@@ -281,6 +291,7 @@ public class TetherChat(
                     pending = item.pendingOut,
                     groups = item.groups,
                     lastSeen = if (features.lastSeen && best == null) seen[item.jid] else null,
+                    avatar = profiles[item.jid]?.avatar,
                 )
             }.sortedBy { it.name.lowercase() }
         }.stateIn(scope, SharingStarted.Eagerly, emptyList())
@@ -290,6 +301,19 @@ public class TetherChat(
      * Stays empty with [ChatFeatures.autoAcceptContacts] on, since every request is accepted at once.
      */
     public val contactRequests: StateFlow<Set<BareJid>> = requests.asStateFlow()
+
+    /**
+     * Our profile, read from the server on each login; null before that, or
+     * with [ChatFeatures.profiles] off. Change it with [updateMyProfile].
+     */
+    public val myProfile: StateFlow<Profile?> get() = im.profiles.mine
+
+    /** Contacts' profiles fetched so far. [contacts] and [conversations] already carry names and pictures from these. */
+    public val profiles: StateFlow<Map<BareJid, Profile>> get() = im.profiles.known
+
+    /** Profiles to fetch, one at a time; [profileQueued] keeps each in the queue once. */
+    private val profileQueue = Channel<BareJid>(Channel.UNLIMITED)
+    private val profileQueued = MutableStateFlow<Set<BareJid>>(emptySet())
 
     /** Outgoing work (messages, markers, typing), one at a time, so it goes out in order. */
     private val work = Channel<suspend () -> Unit>(Channel.UNLIMITED)
@@ -349,6 +373,29 @@ public class TetherChat(
                         val batch = ops.subList(i, j).map { it.first }
                         runCatching { if (delete) messageStore.delete(batch) else messageStore.save(batch) }
                         i = j
+                    }
+                }
+            }
+        }
+        if (features.profiles) {
+            // A contact's presence says when their picture changed: fetch the profile then.
+            scope.launch {
+                im.profiles.avatarHashes.collect { hashes ->
+                    val known = im.profiles.known.value
+                    hashes.forEach { (jid, hash) -> if (known[jid]?.avatar?.hash.orEmpty() != hash || jid !in known) queueProfile(jid) }
+                }
+            }
+            scope.launch {
+                for (jid in profileQueue) {
+                    try {
+                        awaitOnline()
+                        im.profiles.fetch(jid)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        // Their server would not say; [openChat] or [profile] try again.
+                    } finally {
+                        profileQueued.update { it - jid }
                     }
                 }
             }
@@ -469,6 +516,7 @@ public class TetherChat(
         openChats.update { it + peer }
         if (features.history) scope.launch { runCatching { loadNewest(peer) } }
         if (features.lastSeen && features.presence) scope.launch { runCatching { refreshLastSeen(peer) } }
+        if (features.profiles && peer !in im.profiles.known.value) queueProfile(peer)
     }
 
     /**
@@ -592,6 +640,42 @@ public class TetherChat(
     /** Changes what contacts see: away, busy, a status text. */
     public suspend fun setPresence(show: Show? = null, status: String? = null) {
         im.presences.set(OwnPresence(show = show, status = status))
+    }
+
+    // --- Profiles ---------------------------------------------------------------------
+
+    /**
+     * Replaces our profile (name, picture, ...) and tells contacts. To change
+     * one field, copy [myProfile]: `updateMyProfile(chat.myProfile.value!!.copy(nickname = "Al"))`.
+     * Keep the picture small (a 192×192 JPEG of 10–30 KB): servers limit the
+     * size of one stanza. Needs a connection; throws [XmppStanzaException] if
+     * the server refuses, and [IllegalStateException] with [ChatFeatures.profiles] off.
+     */
+    public suspend fun updateMyProfile(profile: Profile) {
+        check(features.profiles) { "ChatFeatures.profiles is off" }
+        im.profiles.publish(profile)
+    }
+
+    /**
+     * [jid]'s profile: the one already fetched, or a fresh one from their
+     * server with [refresh] or when there is none yet. Null when their server
+     * would not say, or with [ChatFeatures.profiles] off. Waits for a connection.
+     */
+    public suspend fun profile(jid: BareJid, refresh: Boolean = false): Profile? {
+        if (!features.profiles) return null
+        if (!refresh) im.profiles.known.value[jid]?.let { return it }
+        awaitOnline()
+        return try {
+            im.profiles.fetch(jid)
+        } catch (e: XmppStanzaException) {
+            null
+        }
+    }
+
+    private fun queueProfile(jid: BareJid) {
+        var added = false
+        profileQueued.update { if (jid in it) it else it + jid.also { added = true } }
+        if (added) profileQueue.trySend(jid)
     }
 
     // --- Push -------------------------------------------------------------------------
@@ -833,7 +917,8 @@ public class TetherChat(
         const val TYPING_PAUSE_MILLIS = 5_000L
         const val TYPING_TIMEOUT_MILLIS = 30_000L
 
-        fun displayName(jid: BareJid, name: String?): String = name?.ifBlank { null } ?: jid.local ?: jid.toString()
+        fun displayName(jid: BareJid, name: String?, profile: Profile? = null): String =
+            name?.ifBlank { null } ?: profile?.displayName ?: jid.local ?: jid.toString()
 
         fun now(): Long = Clock.System.now().toEpochMilliseconds()
 

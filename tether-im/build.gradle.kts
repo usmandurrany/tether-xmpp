@@ -14,6 +14,7 @@ kotlin {
     sourceSets {
         commonMain.dependencies {
             api(project(":tether-core"))
+            implementation(project(":tether-crypto"))
         }
         commonTest.dependencies {
             implementation(kotlin("test"))

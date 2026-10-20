@@ -140,6 +140,7 @@ ChatFeatures(
     lastSeen = true,           // when offline contacts were last online (XEP-0012)
     deleteForEveryone = true,  // delete for everyone, both ways (XEP-0424)
     autoAcceptContacts = false, // accept every contact request at once (off by default)
+    profiles = true,           // names and profile pictures (vCard, XEP-0054 and XEP-0153)
 )
 ```
 
@@ -334,6 +335,31 @@ val header = when {
 
 To ask at another time, call `chat.lastSeen(peer)`. The contact's server only answers people allowed to see their presence, and some servers don't keep it at all, so "unknown" is a normal answer. `ChatFeatures(lastSeen = false)` turns it off.
 
+## Profiles and pictures
+
+Each account has a public profile (a vCard, XEP-0054): names, email, phone, a short "about" and a picture. With `ChatFeatures.profiles` on (the default) there is little to do:
+
+- `chat.myProfile` holds ours, read from the server on each login.
+- `Contact.avatar` and `Conversation.avatar` hold contacts' pictures, and `name` falls back to their profile's nickname or full name when you gave them none.
+- Contacts' apps announce a new picture in their presence (XEP-0153). The SDK then fetches their profile, and also when a chat opens with someone it has none for.
+
+```kotlin
+// Show a picture.
+contact.avatar?.let { image(it.data, it.type) } ?: initials(contact.name)
+
+// Change ours: copy the current one so fields you don't edit are kept.
+val mine = chat.myProfile.value ?: Profile()
+chat.updateMyProfile(mine.copy(nickname = "Jules", avatar = Avatar("image/jpeg", jpegBytes)))
+
+// Everything in someone's profile; refresh = true asks their server again.
+val profile = chat.profile(romeo)
+```
+
+- **Keep pictures small:** a 192×192 JPEG of 10–30 KB. The picture travels inside one stanza, and servers cap stanza size (ejabberd's default is 64 KB once encoded).
+- **Fields the SDK doesn't model** (addresses, a second email) are in `Profile.other`, and saving a copy keeps them.
+- **Pictures are kept in memory only.** They come back from the server after a restart. To show them offline, save `chat.profiles` in your own cache.
+- `updateMyProfile` needs a connection and throws `XmppStanzaException` if the server refuses (too large, say).
+
 ## Deleting messages
 
 ```kotlin
@@ -508,4 +534,5 @@ Tether checks the server's capabilities before turning on any feature, so a miss
 - Client state indication (XEP-0352)
 - Push (XEP-0357) and a push app server for FCM/APNs
 - Last activity (XEP-0012, `mod_last` on ejabberd, `mod_lastactivity` on Prosody), for last seen
+- vCard (XEP-0054, `mod_vcard` on ejabberd and Prosody), for profiles and pictures
 - Message retraction (XEP-0424) is optional on the server: clients handle it, and a server that supports it also removes deleted messages from the archive

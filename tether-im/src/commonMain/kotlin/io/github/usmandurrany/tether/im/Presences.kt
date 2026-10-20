@@ -98,6 +98,9 @@ public class Presences(
     /** Collect before connecting: requests that arrive with no collector are dropped (the server re-sends them on the next login). */
     public val subscriptions: SharedFlow<SubscriptionEvent> = _subscriptions.asSharedFlow()
 
+    /** Added to every presence we send, such as our picture's hash (XEP-0153). Set by [InstantMessaging]. */
+    internal var decorate: (() -> Element?)? = null
+
     /** False until this process has seen a session: a resumed one then carries no presence we know of. */
     @Volatile
     private var started = false
@@ -166,6 +169,11 @@ public class Presences(
         client.send(element("presence", ImNs.CLIENT) { attribute("type", "unavailable") })
     }
 
+    /** Sends our presence again (when it is showing), such as after the picture changed. */
+    internal suspend fun reannounce() {
+        if (announced) client.send(presenceStanza(own))
+    }
+
     /** Asks to see [jid]'s presence. */
     public suspend fun request(jid: BareJid): Unit = subscription(jid, "subscribe")
 
@@ -191,5 +199,6 @@ public class Presences(
         presence.show?.let { element("show") { text(it.wire) } }
         presence.status?.let { element("status") { text(it) } }
         if (presence.priority != 0) element("priority") { text(presence.priority.toString()) }
+        decorate?.invoke()?.let { child(it) }
     }
 }
