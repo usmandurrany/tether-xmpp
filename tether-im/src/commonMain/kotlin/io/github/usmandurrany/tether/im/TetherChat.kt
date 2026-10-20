@@ -416,6 +416,14 @@ public class TetherChat(
      */
     public suspend fun connect(): ConnectResult = client.connect()
 
+    /**
+     * Call when a push notification arrives (from your `FirebaseMessagingService`,
+     * say). Connects, also in the background, so waiting messages arrive in
+     * [conversations] and [messages], then closes again after
+     * `ReconnectPolicy.pushWakeMillis` if the app is still in the background.
+     */
+    public suspend fun wakeForPush(): ConnectResult = client.wakeForPush()
+
     /** Goes offline, keeping everything for the next [connect]. */
     public suspend fun disconnect(): Unit = client.disconnect()
 
@@ -690,6 +698,13 @@ public class TetherChat(
 
     /** Registers this device for push notifications; see [PushTarget] for the fields per server. */
     public suspend fun registerPush(target: PushTarget): Unit = im.push.register(target)
+
+    /**
+     * Gets a node for this device from a push app server (p2, Openfire's or
+     * Tigase's push component; see [PushAppServer]) and registers it. Needs a
+     * connection; throws [PushRegistrationException] if the app server refuses.
+     */
+    public suspend fun registerPush(appServer: PushAppServer): PushTarget = im.push.register(appServer)
 
     /** Stops push notifications to this device. */
     public suspend fun unregisterPush(): Unit = im.push.unregister()
