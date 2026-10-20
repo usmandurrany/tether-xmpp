@@ -146,15 +146,85 @@ Each feature also checks that the server supports it, so a feature the server la
 
 ## Keeping messages
 
-By default messages live in memory. After a restart, recent chats are rebuilt from the server archive, and each chat's history loads when it opens. To keep messages on the device, implement `MessageStore` (three functions: `load`, `save`, `clear`) on Room, SQLDelight or a file, and pass it:
+Messages are kept on the device by default, so ticks, read state, deletions and custom data survive a restart:
 
-```kotlin
-val chat = TetherAndroid.chat(context, jid, password, messageStore = RoomMessageStore(db))
-```
+- **Android:** `TetherAndroid.chat` uses `SqliteMessageStore`, an SQLite database in the app's private storage, one per account.
+- **Desktop:** `TetherJvm.chat` uses `FileMessageStore`, at `~/.tether/<account>.messages`, readable by the user only.
 
-`save` receives every new or changed message; replace by `peer`, `outgoing` and `id`. Keep a message's custom data (below) in one text column with `Payloads.toXml(message.payloads)`, and read it back with `Payloads.fromXml`.
+There's nothing to set up. `signOut()` empties the store. Pass `messageStore = null` to keep messages in memory only; the SDK then rebuilds recent chats from the server archive after a restart.
 
 After each new sign-in the SDK also catches up from the archive: messages sent and received on other devices while this one was offline appear, and ones read elsewhere are marked read.
+
+### Using your own database
+
+To keep messages in Room, SQLDelight, Realm or your own backend, implement `MessageStore` and pass it as `messageStore`. The SDK still does all the logic (status, receipts, read markers, deletions, de-duplication); a store only keeps rows. It has four functions:
+
+| Function | What it must do |
+| --- | --- |
+| `load()` | Return every saved message. Called once, when the chat is created. |
+| `save(messages)` | Insert each message, or **replace** the one with the same peer, direction and id. Called for every new or changed message: a status change is a save. |
+| `delete(messages)` | Remove these messages (same key). |
+| `clear()` | Remove everything, on sign-out. |
+
+The easy way to keep every field right is to store each message whole with `MessageCodec`, keyed by `MessageCodec.keyOf(message)`. New fields in later SDK versions then need no migration. With Room:
+
+```kotlin
+@Entity(tableName = "messages", indices = [Index("peer", "timestamp")])
+data class MessageRow(
+    @PrimaryKey val messageKey: String,   // MessageCodec.keyOf(message)
+    val peer: String,                     // for your own queries
+    val timestamp: Long,
+    val data: String,                     // MessageCodec.encode(message)
+)
+
+@Dao
+interface MessageDao {
+    @Query("SELECT * FROM messages") suspend fun all(): List<MessageRow>
+    @Upsert suspend fun upsert(rows: List<MessageRow>)
+    @Query("DELETE FROM messages WHERE messageKey IN (:keys)") suspend fun delete(keys: List<String>)
+    @Query("DELETE FROM messages") suspend fun clear()
+}
+
+class RoomMessageStore(private val dao: MessageDao) : MessageStore {
+    override suspend fun load() = dao.all().mapNotNull { MessageCodec.decode(it.data) }
+
+    override suspend fun save(messages: List<Message>) = dao.upsert(
+        messages.map { MessageRow(MessageCodec.keyOf(it), it.peer.toString(), it.timestamp, MessageCodec.encode(it)) },
+    )
+
+    override suspend fun delete(messages: List<Message>) = dao.delete(messages.map(MessageCodec::keyOf))
+
+    override suspend fun clear() = dao.clear()
+}
+
+val chat = TetherAndroid.chat(context, jid, password, messageStore = RoomMessageStore(db.messageDao()))
+```
+
+If you'd rather map each field to its own column, keep all of them. Dropping one breaks something:
+
+- **The key is all three of `peer`, `outgoing` and `id`.** The same id can appear in both directions.
+- **`status` and `error`:** without them, ticks reset after a restart.
+- **`serverId`:** without it, archive copies show up twice.
+- **`markable`:** without it, read markers aren't sent.
+- **`fromOtherDevice`** keeps track of messages you sent from another device.
+- **`deleted`** keeps a message deleted for everyone.
+- **`hidden`** keeps a message deleted for you hidden. These rows are never shown, but without them the archive brings the message back.
+- **`payloads`** is the custom data. Keep it in one text column with `Payloads.toXml(message.payloads)` and read it back with `Payloads.fromXml(text)`.
+
+Then check your store from a unit test. `MessageStoreCheck` saves, replaces, hides, deletes and clears test messages, and throws with what came back wrong:
+
+```kotlin
+@Test
+fun roomStoreWorks() = runTest {
+    val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java).build()
+    MessageStoreCheck.run(RoomMessageStore(db.messageDao()))
+}
+```
+
+Rules of thumb:
+- One store per account. If two accounts share a database, add the account to the key or use one table each.
+- The SDK calls the store from a background thread, one call at a time, in order. Don't block it on the main thread.
+- `TetherChat` keeps every message in memory and loads them all at start, so the store doesn't need paging. Show chats from `chat.messages(peer)`, not from your own queries, so what's on screen always matches what the SDK knows.
 
 ## When a message counts as sent
 
@@ -204,7 +274,7 @@ Each field becomes its own tag in the message, next to the text:
 - **The text is the fallback.** Other XMPP apps show only the text, so make it useful: a caption, or the link itself. It can be empty when the data says it all; the SDK then asks the server to keep the message anyway.
 - **Upload first, send the link.** Servers limit message size, often to 64 KB, so put the file on your own storage or the server's HTTP upload service and send its address, never the bytes.
 - **It goes everywhere a message goes:** live, copies from your other devices, offline storage, the archive, and `retry`. A malformed field reads as null rather than throwing, so a bad message from someone else can't break a chat.
-- **Keeping messages on the device:** a `MessageStore` can keep the data in one text column with `Payloads.toXml(message.payloads)` and `Payloads.fromXml(text)`.
+- **Kept on the device:** the built-in stores keep custom data with the message; see [Using your own database](#using-your-own-database) for your own.
 
 ### Your own classes, lists and groups
 

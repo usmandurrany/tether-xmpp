@@ -25,7 +25,8 @@ import java.nio.file.Path
  * Logs in with [password] when given, otherwise with the keys the last login
  * saved in [store] (throws [IllegalArgumentException] when there are none).
  * State and login keys are kept in [store]: by default a file only this user
- * can read, `~/.tether/<account>.properties`. The client runs on its own
+ * can read, `~/.tether/<account>.properties`. Messages are kept in
+ * [messageStore], by default `~/.tether/<account>.messages`. The client runs on its own
  * background threads until [TetherChat.close].
  *
  * Tell the chat when the window loses or gains focus with
@@ -38,8 +39,9 @@ public suspend fun TetherJvm.chat(
     features: ChatFeatures = ChatFeatures(),
     options: ConnectionOptions = ConnectionOptions(),
     policy: ClientPolicy = ClientPolicy(),
-    store: KeyValueStore = FileKeyValueStore(defaultStorePath(jid)),
-    messageStore: MessageStore? = null,
+    store: KeyValueStore = FileKeyValueStore(defaultStorePath(jid, "properties")),
+    /** Keeps messages, ticks and deletions between runs; null keeps them in memory only. */
+    messageStore: MessageStore? = FileMessageStore(defaultStorePath(jid, "messages")),
     logger: TrafficLogger? = null,
 ): TetherChat {
     val vault = CredentialVault(store)
@@ -49,5 +51,5 @@ public suspend fun TetherJvm.chat(
     return TetherChat(client, features, store, messageStore)
 }
 
-private fun defaultStorePath(jid: BareJid): Path =
-    Path.of(System.getProperty("user.home"), ".tether", "$jid.properties")
+private fun defaultStorePath(jid: BareJid, extension: String): Path =
+    Path.of(System.getProperty("user.home"), ".tether", "$jid.$extension")

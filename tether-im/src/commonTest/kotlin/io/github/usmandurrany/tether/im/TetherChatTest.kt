@@ -407,4 +407,60 @@ class TetherChatTest {
         assertNotNull(h.chat.conversations.value.single().lastSeen)
         assertFalse(h.chat.conversations.value.single().online)
     }
+
+    private class MemoryStore : MessageStore {
+        val rows = LinkedHashMap<String, Message>()
+        override suspend fun load() = rows.values.toList()
+        override suspend fun save(messages: List<Message>) { messages.forEach { rows[MessageCodec.keyOf(it)] = it } }
+        override suspend fun delete(messages: List<Message>) { messages.forEach { rows.remove(MessageCodec.keyOf(it)) } }
+        override suspend fun clear() { rows.clear() }
+    }
+
+    @Test
+    fun theStoreKeepsTicksAndLoadsThemBack() = runTest {
+        val store = MemoryStore()
+        val negotiator = StreamNegotiator(
+            XmppConfig(BareJid.parse("juliet@example.com"), password = "x"),
+            object : XmppTransportFactory {
+                override suspend fun connect(endpoint: Endpoint, serverName: String): XmppTransport = error("offline test")
+            },
+            EndpointResolver({ emptyList() }),
+        )
+        val client = XmppClient(negotiator, backgroundScope)
+        val chat = TetherChat(client, ChatFeatures(), messageStore = store)
+        chat.im.messaging.onSessionStarted(FakeSession(FakeSender()))
+        runCurrent()
+        val m = chat.send(romeo, "hi")
+        runCurrent()
+        chat.im.messaging.onStanza(xml("<message from='romeo@example.net/o'><received xmlns='urn:xmpp:receipts' id='${m.id}'/></message>"))
+        runCurrent()
+        assertEquals(MessageStatus.DELIVERED, store.rows.values.single().status)
+
+        // A new chat on the same store starts with what was saved.
+        val again = TetherChat(XmppClient(negotiator, backgroundScope), ChatFeatures(), messageStore = store)
+        runCurrent()
+        assertEquals(MessageStatus.DELIVERED, again.allMessages.value[romeo].orEmpty().single().status)
+    }
+
+    @Test
+    fun retryRemovesTheFailedCopyFromTheStore() = runTest {
+        val store = MemoryStore()
+        val negotiator = StreamNegotiator(
+            XmppConfig(BareJid.parse("juliet@example.com"), password = "x"),
+            object : XmppTransportFactory {
+                override suspend fun connect(endpoint: Endpoint, serverName: String): XmppTransport = error("offline test")
+            },
+            EndpointResolver({ emptyList() }),
+        )
+        val chat = TetherChat(XmppClient(negotiator, backgroundScope), ChatFeatures(), messageStore = store)
+        chat.im.messaging.onSessionStarted(FakeSession(FakeSender()))
+        runCurrent()
+        val m = chat.send(romeo, "hi")
+        runCurrent()
+        chat.im.messaging.onStanza(xml("<message from='romeo@example.net' type='error' id='${m.id}'><error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>"))
+        runCurrent()
+        val again = assertNotNull(chat.retry(chat.allMessages.value[romeo].orEmpty().single()))
+        runCurrent()
+        assertEquals(listOf(again.id), store.rows.values.map { it.id })
+    }
 }

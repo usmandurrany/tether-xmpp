@@ -99,7 +99,8 @@ public object TetherAndroid {
         options: ConnectionOptions = ConnectionOptions(),
         policy: ClientPolicy = ClientPolicy(),
         store: KeyValueStore = secureStore(context),
-        messageStore: MessageStore? = null,
+        /** Keeps messages, ticks and deletions between runs; null keeps them in memory only. */
+        messageStore: MessageStore? = SqliteMessageStore(context, jid),
         logger: TrafficLogger? = null,
     ): TetherChat {
         val vault = CredentialVault(store)

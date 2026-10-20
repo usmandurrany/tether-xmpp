@@ -128,9 +128,16 @@ public data class Contact(
 )
 
 /**
- * Where [TetherChat] keeps messages between runs: back it with Room,
- * SQLDelight or a file. Without one, messages live in memory and chats are
- * refilled from the server archive after a restart.
+ * Where [TetherChat] keeps messages between runs, so ticks, read state,
+ * deletions and custom data survive a restart. `TetherAndroid.chat` and
+ * `TetherJvm.chat` use a built-in one (SQLite on Android, a file on the
+ * desktop); pass your own to use Room, SQLDelight or anything else, or null
+ * to keep messages in memory only.
+ *
+ * The SDK does all the logic: a store only keeps rows. A message's identity
+ * is [Message.peer], [Message.outgoing] and [Message.id] together;
+ * [MessageCodec] turns a whole message into one string, and
+ * [MessageStoreCheck] tests an implementation.
  */
 public interface MessageStore {
     /** Every saved message, in any order. */
@@ -138,6 +145,9 @@ public interface MessageStore {
 
     /** Adds the messages, or replaces those with the same [Message.peer], [Message.outgoing] and [Message.id]. */
     public suspend fun save(messages: List<Message>)
+
+    /** Removes these messages (matched by peer, outgoing and id), such as a failed message that was sent again. */
+    public suspend fun delete(messages: List<Message>)
 
     /** Forgets every message, on sign-out. */
     public suspend fun clear()
@@ -278,7 +288,8 @@ public class TetherChat(
 
     /** Outgoing work (messages, markers, typing), one at a time, so it goes out in order. */
     private val work = Channel<suspend () -> Unit>(Channel.UNLIMITED)
-    private val saves = Channel<Message>(Channel.UNLIMITED)
+    /** Store writes, in order: a message to save, or (with `true`) one to delete. */
+    private val saves = Channel<Pair<Message, Boolean>>(Channel.UNLIMITED)
 
     // Typing we send, touched only from the work queue.
     private val composing = HashSet<BareJid>()
@@ -317,9 +328,18 @@ public class TetherChat(
             scope.launch {
                 runCatching { messageStore.load() }.getOrNull()?.let { merge(it) { old, new -> old.mergedWith(new) } }
                 for (first in saves) {
-                    val batch = arrayListOf(first)
-                    while (true) batch += saves.tryReceive().getOrNull() ?: break
-                    runCatching { messageStore.save(batch) }
+                    val ops = arrayListOf(first)
+                    while (true) ops += saves.tryReceive().getOrNull() ?: break
+                    // Consecutive saves (or deletes) go in one call; the order between them is kept.
+                    var i = 0
+                    while (i < ops.size) {
+                        val delete = ops[i].second
+                        var j = i
+                        while (j < ops.size && ops[j].second == delete) j++
+                        val batch = ops.subList(i, j).map { it.first }
+                        runCatching { if (delete) messageStore.delete(batch) else messageStore.save(batch) }
+                        i = j
+                    }
                 }
             }
         }
@@ -664,6 +684,7 @@ public class TetherChat(
 
     private fun remove(message: Message) {
         update(message.peer) { list -> list.filterNot { it.id == message.id && it.outgoing == message.outgoing } }
+        if (messageStore != null) saves.trySend(message to true)
     }
 
     /** Changes one chat and saves what changed. */
@@ -675,7 +696,7 @@ public class TetherChat(
             changed = if (after === before || messageStore == null) emptyList() else after.filter { it !in before }
             if (after === before) all else all + (peer to after)
         }
-        changed.forEach { saves.trySend(it) }
+        changed.forEach { saves.trySend(it to false) }
     }
 
     /** Adds [incoming] messages, combining each with one already known through [combine]. */

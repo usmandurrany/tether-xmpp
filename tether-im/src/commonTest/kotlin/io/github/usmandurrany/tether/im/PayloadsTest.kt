@@ -185,4 +185,31 @@ class PayloadsTest {
         assertNull(m.data("video"))
         assertEquals(listOf("photo", "location"), m.allData().map { it.type })
     }
+
+    @Test
+    fun theCodecKeepsEveryField() {
+        val m = Message(
+            id = "m1", peer = romeo, outgoing = true, body = "a <b> & \"c\"\nd", timestamp = 1234, status = MessageStatus.FAILED,
+            serverId = "s1", error = "item-not-found", thread = "t", markable = true, fromOtherDevice = true,
+            payloads = listOf(MessageData("photo", "url" to "u?a=1&b=2").toElement()),
+        )
+        assertEquals(m, MessageCodec.decode(MessageCodec.encode(m)))
+        val gone = m.copy(deleted = true, hidden = true, body = "", payloads = emptyList(), serverId = null, error = null, thread = null)
+        assertEquals(gone, MessageCodec.decode(MessageCodec.encode(gone)))
+        assertNull(MessageCodec.decode("<nope/>"))
+        assertNull(MessageCodec.decode("not xml"))
+    }
+
+    @Test
+    fun theStoreCheckCatchesAStoreThatDoesNotReplace() = runTest {
+        val appendOnly = object : MessageStore {
+            val rows = ArrayList<Message>()
+            override suspend fun load() = rows.toList()
+            override suspend fun save(messages: List<Message>) { rows += messages }
+            override suspend fun delete(messages: List<Message>) { rows.removeAll { r -> messages.any { it.id == r.id && it.peer == r.peer && it.outgoing == r.outgoing } } }
+            override suspend fun clear() { rows.clear() }
+        }
+        val error = assertFailsWith<IllegalStateException> { MessageStoreCheck.run(appendOnly) }
+        assertTrue("replace" in error.message.orEmpty())
+    }
 }
