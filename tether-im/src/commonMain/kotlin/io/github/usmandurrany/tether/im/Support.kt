@@ -22,6 +22,9 @@ internal object ImNs {
     const val DATA_FORMS = "jabber:x:data"
     const val PUSH = "urn:xmpp:push:0"
     const val STANZAS = "urn:ietf:params:xml:ns:xmpp-stanzas"
+    const val RETRACT = "urn:xmpp:message-retract:1"
+    const val FALLBACK = "urn:xmpp:fallback:0"
+    const val LAST = "jabber:iq:last"
 }
 
 /** The bare part of an address from the wire, or null when it is missing or malformed. */

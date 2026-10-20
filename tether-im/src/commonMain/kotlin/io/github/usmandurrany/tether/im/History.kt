@@ -24,6 +24,17 @@ public data class HistoryPage(
     val complete: Boolean,
     /** Delivery receipts and read markers archived in the same range, oldest first. */
     val markers: List<ArchivedMarker> = emptyList(),
+    /** Messages deleted for everyone (XEP-0424) in the same range: retractions, or the server's tombstones. */
+    val retractions: List<ArchivedRetraction> = emptyList(),
+)
+
+/** A message deleted for everyone, found in the archive. */
+public data class ArchivedRetraction(
+    val peer: BareJid,
+    /** The id of the deleted message. */
+    val id: String,
+    /** The deleted message was ours; false when it was the contact's. */
+    val outgoing: Boolean,
 )
 
 /** A delivery receipt (XEP-0184) or chat marker (XEP-0333) found in the archive. */
@@ -58,6 +69,7 @@ public class History(private val client: StanzaSender) : ClientExtension {
     private class Collected {
         val messages = ArrayList<ChatMessage>()
         val markers = ArrayList<ArchivedMarker>()
+        val retractions = ArrayList<ArchivedRetraction>()
     }
 
     override suspend fun onSessionStarted(session: SessionContext) {
@@ -106,6 +118,7 @@ public class History(private val client: StanzaSender) : ClientExtension {
             return HistoryPage(
                 messages = collected?.messages?.toList().orEmpty(),
                 markers = collected?.markers?.toList().orEmpty(),
+                retractions = collected?.retractions?.toList().orEmpty(),
                 first = set?.child("first", ImNs.RSM)?.text,
                 last = set?.child("last", ImNs.RSM)?.text,
                 complete = fin?.attribute("complete") == "true",
@@ -126,6 +139,10 @@ public class History(private val client: StanzaSender) : ClientExtension {
         val inner = forwarded.child("message", ImNs.CLIENT) ?: return true
         val outgoing = me != null && bareOf(inner.attribute("from")) == me
         val peer = bareOf(if (outgoing) inner.attribute("to") else inner.attribute("from")) ?: return true
+        retractionOf(inner, peer, outgoing)?.let { r ->
+            mutex.withLock { collecting[queryId]?.retractions?.add(r) }
+            return true
+        }
         if (inner.child("body", ImNs.CLIENT) == null) {
             markerOf(inner, peer, outgoing)?.let { marker -> mutex.withLock { collecting[queryId]?.markers?.add(marker) } }
             return true
@@ -141,6 +158,18 @@ public class History(private val client: StanzaSender) : ClientExtension {
         ) ?: return true
         mutex.withLock { collecting[queryId]?.messages?.add(message) }
         return true
+    }
+
+    /**
+     * A retraction (its sender deleted message `id`), or a tombstone the server
+     * left in place of a deleted message (XEP-0424 §6).
+     */
+    private fun retractionOf(message: Element, peer: BareJid, outgoing: Boolean): ArchivedRetraction? {
+        if (message.attribute("type") == "groupchat") return null
+        Messaging.retractedIdOf(message)?.let { return ArchivedRetraction(peer, it, outgoing) }
+        if (message.child("retracted", ImNs.RETRACT) == null) return null
+        val id = message.child("origin-id", ImNs.SID)?.attribute("id") ?: message.attribute("id") ?: return null
+        return ArchivedRetraction(peer, id, outgoing)
     }
 
     private fun markerOf(message: Element, peer: BareJid, outgoing: Boolean): ArchivedMarker? {

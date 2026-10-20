@@ -262,6 +262,8 @@ public object Payloads {
         ImNs.SID,
         ImNs.HINTS,
         ImNs.MAM,
+        ImNs.RETRACT,
+        ImNs.FALLBACK,
         "urn:xmpp:sm:3",
     )
 

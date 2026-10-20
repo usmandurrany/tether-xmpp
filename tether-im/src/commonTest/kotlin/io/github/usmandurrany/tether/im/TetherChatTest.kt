@@ -322,4 +322,89 @@ class TetherChatTest {
         val theirs = h.chat.allMessages.value[romeo].orEmpty().single { !it.outgoing }
         assertEquals(800, theirs.data("photo")?.int("width"))
     }
+
+    @Test
+    fun deleteForEveryoneEmptiesOurMessageAndTellsTheContact() = runTest {
+        val h = harness()
+        val m = h.chat.send(romeo, "oops", MessageData("photo", "url" to "u"))
+        runCurrent()
+        assertTrue(h.chat.deleteForEveryone(m))
+        runCurrent()
+        val shown = h.chat.allMessages.value[romeo].orEmpty().single()
+        assertTrue(shown.deleted)
+        assertEquals("", shown.body)
+        assertTrue(shown.payloads.isEmpty())
+        assertEquals(m.id, h.sent().last().child("retract", ImNs.RETRACT)?.attribute("id"))
+    }
+
+    @Test
+    fun onlyTheSenderCanDeleteTheirMessage() = runTest {
+        val h = harness()
+        h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>one</body></message>")
+        runCurrent()
+        val theirs = h.chat.allMessages.value[romeo].orEmpty().single()
+        assertFalse(h.chat.deleteForEveryone(theirs), "not ours")
+        // Someone else's retraction of Romeo's message does nothing.
+        h.incoming("<message from='mallory@evil.example/x' type='chat'><retract xmlns='urn:xmpp:message-retract:1' id='r1'/><body>f</body></message>")
+        runCurrent()
+        assertFalse(h.chat.allMessages.value[romeo].orEmpty().single().deleted)
+        // Romeo's own does.
+        h.incoming("<message from='romeo@example.net/o' type='chat'><retract xmlns='urn:xmpp:message-retract:1' id='r1'/><body>f</body></message>")
+        runCurrent()
+        val after = h.chat.allMessages.value[romeo].orEmpty().single()
+        assertTrue(after.deleted)
+        assertEquals(MessageStatus.READ, after.status, "a deleted message is not unread")
+        assertEquals(0, h.chat.unreadCount.value)
+    }
+
+    @Test
+    fun aDeletionThatArrivesFirstStillApplies() = runTest {
+        val h = harness()
+        h.chat.importPage(
+            HistoryPage(emptyList(), null, null, true, retractions = listOf(ArchivedRetraction(romeo, "r1", outgoing = false))),
+            unread = false,
+        )
+        h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>late copy</body></message>")
+        runCurrent()
+        assertTrue(h.chat.allMessages.value[romeo].orEmpty().single().deleted)
+    }
+
+    @Test
+    fun deletionsCanBeSwitchedOff() = runTest {
+        val h = harness(ChatFeatures(deleteForEveryone = false))
+        h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>one</body></message>")
+        h.incoming("<message from='romeo@example.net/o' type='chat'><retract xmlns='urn:xmpp:message-retract:1' id='r1'/><body>f</body></message>")
+        runCurrent()
+        val list = h.chat.allMessages.value[romeo].orEmpty()
+        assertEquals(listOf("one"), list.map { it.body }, "kept, and no fallback text shown")
+        assertFalse(h.chat.deleteForEveryone(h.chat.send(romeo, "x")))
+    }
+
+    @Test
+    fun deleteForMeHidesItAndTheArchiveCannotBringItBack() = runTest {
+        val h = harness()
+        h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>one</body></message>")
+        runCurrent()
+        h.chat.deleteForMe(h.chat.allMessages.value[romeo].orEmpty().single())
+        runCurrent()
+        assertTrue(h.chat.allMessages.value[romeo].orEmpty().isEmpty())
+        assertEquals(0, h.chat.unreadCount.value)
+        h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>one</body></message>")
+        runCurrent()
+        assertTrue(h.chat.allMessages.value[romeo].orEmpty().isEmpty())
+        assertTrue(h.chat.conversations.value.isEmpty())
+    }
+
+    @Test
+    fun aContactWhoGoesOfflineShowsWhenTheyWereLastSeen() = runTest {
+        val h = harness()
+        h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>hi</body></message>")
+        h.chat.im.presences.onStanza(xml("<presence from='romeo@example.net/o'/>"))
+        runCurrent()
+        assertNull(h.chat.conversations.value.single().lastSeen, "online: no last seen")
+        h.chat.im.presences.onStanza(xml("<presence from='romeo@example.net/o' type='unavailable'/>"))
+        runCurrent()
+        assertNotNull(h.chat.conversations.value.single().lastSeen)
+        assertFalse(h.chat.conversations.value.single().online)
+    }
 }

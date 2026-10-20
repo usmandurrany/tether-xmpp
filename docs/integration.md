@@ -135,6 +135,8 @@ ChatFeatures(
     presence = true,           // contacts' online status and requests
     multiDevice = true,        // messages from our other devices (carbons, XEP-0280)
     history = true,            // the server archive (XEP-0313)
+    lastSeen = true,           // when offline contacts were last online (XEP-0012)
+    deleteForEveryone = true,  // delete for everyone, both ways (XEP-0424)
 )
 ```
 
@@ -231,6 +233,35 @@ Data sent this way and as `MessageData` with the same type name share one format
 - **Raw XML:** `message.payloads` holds every element in the message that the SDK doesn't handle itself, including other apps' data such as `jabber:x:oob` links. For a shape fields can't express, implement `PayloadType` and build the `Element` with the `element(...)` builder.
 - **What's refused:** namespaces the SDK uses itself (receipts, markers, typing and so on) throw `IllegalArgumentException`, and they never show up in `payloads`.
 - **Protocol level:** `im.messaging.send(to, body, payloads = listOf(MessageData(…).toElement()))`, and `ChatMessage.data(type)` or `ChatMessage.payload(type)` on received messages.
+
+## Last seen
+
+`Contact.lastSeen` and `Conversation.lastSeen` hold when an offline contact was last online, in milliseconds since the epoch. They are null while the contact is online, or when the time isn't known. There is nothing to call:
+
+- When a contact goes offline while you are connected, the SDK notes the time.
+- When a chat opens (`openChat`) with an offline contact, the SDK asks the server (XEP-0012).
+
+```kotlin
+val header = when {
+    conversation.online -> "online"
+    conversation.lastSeen != null -> "last seen ${formatTime(conversation.lastSeen)}"
+    else -> ""
+}
+```
+
+To ask at another time, call `chat.lastSeen(peer)`. The contact's server only answers people allowed to see their presence, and some servers don't keep it at all, so "unknown" is a normal answer. `ChatFeatures(lastSeen = false)` turns it off.
+
+## Deleting messages
+
+```kotlin
+chat.deleteForEveryone(message)   // ours only; returns false for theirs
+chat.deleteForMe(message)         // any message, this device only
+```
+
+- **Delete for everyone** (XEP-0424) works on your own messages. The message stays in the list as `message.deleted == true`, with no text or data, so show a placeholder such as "This message was deleted". It is deleted on your other devices too. The contact's app removes it if it supports deletion; older apps show a short note instead. A server that supports it may also remove the message from the archive.
+- **When a contact deletes theirs,** the same happens here: `message.deleted` turns true, and an unread one stops counting as unread. Only a message's own sender can delete it; a deletion from anyone else is ignored. A deletion that arrives before its message (from the archive, say) still applies when the message comes in.
+- **Delete for me** removes the message from this device's lists. It keeps a hidden copy (`message.hidden`), so a copy from the archive can't bring it back. A `MessageStore` should save it like any other message.
+- `ChatFeatures(deleteForEveryone = false)` ignores contacts' deletions and makes `deleteForEveryone` return false.
 
 ## Push notifications
 
@@ -393,3 +424,5 @@ Tether checks the server's capabilities before turning on any feature, so a miss
 - Message carbons (XEP-0280)
 - Client state indication (XEP-0352)
 - Push (XEP-0357) and a push app server for FCM/APNs
+- Last activity (XEP-0012, `mod_last` on ejabberd, `mod_lastactivity` on Prosody), for last seen
+- Message retraction (XEP-0424) is optional on the server: clients handle it, and a server that supports it also removes deleted messages from the archive

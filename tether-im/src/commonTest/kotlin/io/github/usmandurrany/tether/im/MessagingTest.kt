@@ -201,4 +201,52 @@ class MessagingTest {
         assertEquals(null, m.child("markable", ImNs.MARKERS))
         assertEquals(null, m.child("active", ImNs.CHAT_STATES))
     }
+
+    @Test
+    fun retractionsAreSentWithAFallbackAndStored() = runTest {
+        val sender = FakeSender()
+        val messaging = started(sender)
+        messaging.retract(romeo, "m1")
+        val m = sender.sent.single()
+        assertEquals("m1", m.child("retract", ImNs.RETRACT)?.attribute("id"))
+        assertEquals(ImNs.RETRACT, m.child("fallback", ImNs.FALLBACK)?.attribute("for"))
+        assertEquals(Messaging.RETRACT_FALLBACK, m.child("body")?.text)
+        assertNotNull(m.child("store", ImNs.HINTS))
+    }
+
+    @Test
+    fun incomingRetractionsAreEventsNotMessages() = runTest {
+        val sender = FakeSender()
+        val messaging = started(sender)
+        val events = async { messaging.events.take(2).toList() }
+        yield()
+        messaging.onStanza(xml("<message from='romeo@example.net/o' type='chat' id='x'><retract xmlns='urn:xmpp:message-retract:1' id='r1'/><body>fallback</body><request xmlns='urn:xmpp:receipts'/></message>"))
+        // Our own deletion from another device, as a carbon.
+        messaging.onStanza(
+            xml(
+                "<message from='juliet@example.com' type='chat'><sent xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>" +
+                    "<message xmlns='jabber:client' from='juliet@example.com/laptop' to='romeo@example.net' type='chat'><retract xmlns='urn:xmpp:message-retract:1' id='m1'/><body>fallback</body></message>" +
+                    "</forwarded></sent></message>",
+            ),
+        )
+        assertEquals(
+            listOf(MessageEvent.Retracted(romeo, "r1", outgoing = false), MessageEvent.Retracted(romeo, "m1", outgoing = true)),
+            events.await(),
+        )
+        assertTrue(sender.sent.isEmpty(), "no receipt for a retraction")
+    }
+
+    @Test
+    fun lastActivityTurnsSecondsIntoATime() = runTest {
+        val sender = FakeSender { iq -> xml("<iq type='result' id='${iq.attribute("id")}' from='romeo@example.net'><query xmlns='jabber:iq:last' seconds='120'/></iq>") }
+        val before = kotlin.time.Clock.System.now().toEpochMilliseconds()
+        val seen = assertNotNull(LastActivity(sender).lastSeen(romeo))
+        assertEquals("romeo@example.net", sender.requests.single().attribute("to"))
+        assertTrue(seen in (before - 125_000)..(before - 115_000))
+
+        assertEquals(null, LastActivity(FakeSender { FakeSender.error(it, "forbidden") }).lastSeen(romeo))
+        // An answer from someone else is not Romeo's.
+        val forged = FakeSender { iq -> xml("<iq type='result' id='${iq.attribute("id")}' from='mallory@evil.example'><query xmlns='jabber:iq:last' seconds='1'/></iq>") }
+        assertEquals(null, LastActivity(forged).lastSeen(romeo))
+    }
 }

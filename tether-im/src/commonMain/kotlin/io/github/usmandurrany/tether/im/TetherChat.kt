@@ -77,6 +77,16 @@ public data class Message(
     /** Ours, but sent from another of our devices. */
     val fromOtherDevice: Boolean = false,
     /**
+     * Deleted for everyone, by us or by the contact (XEP-0424). Its text and
+     * data are gone; show a placeholder such as "This message was deleted".
+     */
+    val deleted: Boolean = false,
+    /**
+     * Deleted for me ([TetherChat.deleteForMe]). Never in the SDK's lists; kept
+     * so a [MessageStore] remembers it and the archive cannot bring it back.
+     */
+    val hidden: Boolean = false,
+    /**
      * The app's own data sent with the message, such as a picture's link and
      * size. Read it with `message.data("photo")`, or `message.payload(PhotoType)`
      * for a [PayloadType].
@@ -95,6 +105,8 @@ public data class Conversation(
     /** The contact is typing right now. */
     val typing: Boolean,
     val online: Boolean,
+    /** When the contact was last online, in milliseconds since the epoch; null while online or when unknown. */
+    val lastSeen: Long? = null,
 )
 
 /** One entry of the contact list, with what we know of their presence. */
@@ -111,6 +123,8 @@ public data class Contact(
     /** We asked to see their presence and they have not answered yet. */
     val pending: Boolean,
     val groups: Set<String>,
+    /** When they were last online, in milliseconds since the epoch; null while online or when unknown. */
+    val lastSeen: Long? = null,
 )
 
 /**
@@ -199,9 +213,21 @@ public class TetherChat(
     private val typingTokens = MutableStateFlow<Map<BareJid, Long>>(emptyMap())
     private val openChats = MutableStateFlow<Set<BareJid>>(emptySet())
     private val requests = MutableStateFlow<Set<BareJid>>(emptySet())
+    private val askedLastSeen = MutableStateFlow<Map<BareJid, Long>>(emptyMap())
+
+    /** Deletions that arrived before the message they delete: (peer, outgoing, id). */
+    private val pendingRetractions = MutableStateFlow<Set<Triple<BareJid, Boolean, String>>>(emptySet())
 
     /** Every message, per contact, oldest first. */
-    public val allMessages: StateFlow<Map<BareJid, List<Message>>> = threads.asStateFlow()
+    public val allMessages: StateFlow<Map<BareJid, List<Message>>> =
+        threads.map { all -> all.mapValues { (_, list) -> list.filterNot { it.hidden } } }
+            .stateIn(scope, SharingStarted.Eagerly, emptyMap())
+
+    /** When each offline contact was last online, as far as we know. */
+    private val lastSeenTimes: StateFlow<Map<BareJid, Long>> =
+        combine(askedLastSeen, im.presences.wentOffline) { asked, watched ->
+            (asked.keys + watched.keys).associateWith { maxOf(asked[it] ?: 0, watched[it] ?: 0) }
+        }.stateIn(scope, SharingStarted.Eagerly, emptyMap())
 
     /** Contacts typing right now. */
     public val typingContacts: StateFlow<Set<BareJid>> =
@@ -209,7 +235,7 @@ public class TetherChat(
 
     /** The chat list, most recent first. */
     public val conversations: StateFlow<List<Conversation>> =
-        combine(threads, typingContacts, im.roster.items, im.presences.contacts) { all, typing, roster, online ->
+        combine(allMessages, typingContacts, im.roster.items, im.presences.contacts, lastSeenTimes) { all, typing, roster, online, seen ->
             all.filterValues { it.isNotEmpty() }.map { (peer, messages) ->
                 Conversation(
                     peer = peer,
@@ -218,18 +244,19 @@ public class TetherChat(
                     unreadCount = messages.count { it.status == MessageStatus.UNREAD },
                     typing = peer in typing,
                     online = !online[peer].isNullOrEmpty(),
+                    lastSeen = if (features.lastSeen && online[peer].isNullOrEmpty()) seen[peer] else null,
                 )
             }.sortedByDescending { it.lastMessage?.timestamp ?: 0 }
         }.stateIn(scope, SharingStarted.Eagerly, emptyList())
 
     /** Unread messages in every chat, for an app badge. */
     public val unreadCount: StateFlow<Int> =
-        threads.map { all -> all.values.sumOf { list -> list.count { it.status == MessageStatus.UNREAD } } }
+        allMessages.map { all -> all.values.sumOf { list -> list.count { it.status == MessageStatus.UNREAD } } }
             .distinctUntilChanged().stateIn(scope, SharingStarted.Eagerly, 0)
 
     /** The contact list, sorted by name. Empty when [ChatFeatures.contacts] is off. */
     public val contacts: StateFlow<List<Contact>> =
-        combine(im.roster.items, im.presences.contacts) { roster, online ->
+        combine(im.roster.items, im.presences.contacts, lastSeenTimes) { roster, online, seen ->
             roster.values.map { item ->
                 val best = online[item.jid].orEmpty().maxByOrNull { it.priority }
                 Contact(
@@ -241,6 +268,7 @@ public class TetherChat(
                     subscription = item.subscription,
                     pending = item.pendingOut,
                     groups = item.groups,
+                    lastSeen = if (features.lastSeen && best == null) seen[item.jid] else null,
                 )
             }.sortedBy { it.name.lowercase() }
         }.stateIn(scope, SharingStarted.Eagerly, emptyList())
@@ -338,8 +366,8 @@ public class TetherChat(
 
     /** One chat's messages, oldest first. */
     public fun messages(peer: BareJid): StateFlow<List<Message>> =
-        threads.map { it[peer].orEmpty() }.distinctUntilChanged()
-            .stateIn(scope, SharingStarted.WhileSubscribed(), threads.value[peer].orEmpty())
+        allMessages.map { it[peer].orEmpty() }.distinctUntilChanged()
+            .stateIn(scope, SharingStarted.WhileSubscribed(), allMessages.value[peer].orEmpty())
 
     /**
      * Sends [text] with the app's own [data], such as
@@ -410,6 +438,53 @@ public class TetherChat(
     public fun openChat(peer: BareJid) {
         openChats.update { it + peer }
         if (features.history) scope.launch { runCatching { loadNewest(peer) } }
+        if (features.lastSeen && features.presence) scope.launch { runCatching { refreshLastSeen(peer) } }
+    }
+
+    /**
+     * Asks the server when [peer] was last online, and returns it in
+     * milliseconds since the epoch: null while they are online, or when their
+     * server does not say (it only tells contacts who may see their presence).
+     * [openChat] does this for you; [contacts] and [conversations] then show it.
+     */
+    public suspend fun lastSeen(peer: BareJid): Long? {
+        if (!features.lastSeen) return null
+        refreshLastSeen(peer)
+        return if (im.presences.contacts.value[peer].isNullOrEmpty()) lastSeenTimes.value[peer] else null
+    }
+
+    private suspend fun refreshLastSeen(peer: BareJid) {
+        awaitOnline()
+        if (!im.presences.contacts.value[peer].isNullOrEmpty()) return
+        val seen = im.lastActivity.lastSeen(peer) ?: return
+        askedLastSeen.update { it + (peer to seen) }
+    }
+
+    /**
+     * Deletes our [message] for everyone (XEP-0424). It stays in the chat as
+     * [Message.deleted], with no text, here and on our other devices; the
+     * contact's app removes it if it supports deletion, and shows a short note
+     * otherwise. Returns false for a message that is not ours, or when
+     * [ChatFeatures.deleteForEveryone] is off.
+     */
+    public fun deleteForEveryone(message: Message): Boolean {
+        if (!features.deleteForEveryone || !message.outgoing) return false
+        markDeleted(message.peer, message.id, outgoing = true)
+        work.trySend { im.messaging.retract(message.peer, message.id) }
+        return true
+    }
+
+    /**
+     * Deletes [message] on this device only: it leaves the lists and does not
+     * come back from the archive (as long as the [MessageStore] keeps it, when
+     * there is one). The contact still has it.
+     */
+    public fun deleteForMe(message: Message) {
+        update(message.peer) { list ->
+            list.map { m ->
+                if (m.id == message.id && m.outgoing == message.outgoing) m.asHidden() else m
+            }
+        }
     }
 
     /** The chat with [peer] left the screen. */
@@ -510,6 +585,7 @@ public class TetherChat(
             is MessageEvent.Delivered -> setStatus(event.id, MessageStatus.DELIVERED, peer = event.peer)
             is MessageEvent.Displayed -> if (features.readMarkers) markUpTo(event.peer, event.id, outgoing = true)
             is MessageEvent.DisplayedElsewhere -> markUpTo(event.peer, event.id, outgoing = false)
+            is MessageEvent.Retracted -> if (features.deleteForEveryone) markDeleted(event.peer, event.id, event.outgoing)
             is MessageEvent.Failed -> setStatus(event.id, MessageStatus.FAILED, peer = event.peer, error = event.condition ?: "error")
             is MessageEvent.ChatStateChanged -> if (features.typingIndicators) {
                 if (event.state == ChatState.COMPOSING) {
@@ -570,6 +646,22 @@ public class TetherChat(
         }
     }
 
+    /** Deletes a message for everyone; remembers the deletion when the message has not arrived yet. */
+    private fun markDeleted(peer: BareJid, id: String, outgoing: Boolean) {
+        var found = false
+        update(peer) { list ->
+            list.map { m ->
+                if (m.id == id && m.outgoing == outgoing) {
+                    found = true
+                    m.asDeleted()
+                } else {
+                    m
+                }
+            }
+        }
+        if (!found) pendingRetractions.update { it + Triple(peer, outgoing, id) }
+    }
+
     private fun remove(message: Message) {
         update(message.peer) { list -> list.filterNot { it.id == message.id && it.outgoing == message.outgoing } }
     }
@@ -588,7 +680,13 @@ public class TetherChat(
 
     /** Adds [incoming] messages, combining each with one already known through [combine]. */
     private fun merge(incoming: List<Message>, combine: (old: Message, new: Message) -> Message) {
-        for ((peer, batch) in incoming.groupBy { it.peer }) {
+        val arrived = incoming.map { m ->
+            val key = Triple(m.peer, m.outgoing, m.id)
+            var deleted = false
+            pendingRetractions.update { pending -> deleted = key in pending; if (deleted) pending - key else pending }
+            if (deleted) m.asDeleted() else m
+        }
+        for ((peer, batch) in arrived.groupBy { it.peer }) {
             update(peer) { list ->
                 var result = list
                 for (m in batch) {
@@ -648,6 +746,7 @@ public class TetherChat(
 
     internal fun importPage(page: HistoryPage, unread: Boolean) {
         merge(page.messages.mapNotNull { it.toMessage(unread) }) { old, new -> old.mergedWith(new) }
+        if (features.deleteForEveryone) page.retractions.forEach { markDeleted(it.peer, it.id, it.outgoing) }
         for (marker in page.markers) {
             when {
                 // The contact read or got ours.
@@ -742,11 +841,33 @@ public class TetherChat(
          * keep what we knew, add what is new. Only a read marker, never a copy,
          * makes one of theirs read: otherwise we would not tell them we read it.
          */
-        fun Message.mergedWith(other: Message): Message = (if (outgoing) raisedTo(other.status) else this).copy(
-            serverId = serverId ?: other.serverId,
-            markable = markable || other.markable,
-            thread = thread ?: other.thread,
-            payloads = payloads.ifEmpty { other.payloads },
+        fun Message.mergedWith(other: Message): Message {
+            val merged = (if (outgoing) raisedTo(other.status) else this).copy(
+                serverId = serverId ?: other.serverId,
+                markable = markable || other.markable,
+                thread = thread ?: other.thread,
+                payloads = payloads.ifEmpty { other.payloads },
+            )
+            // A deletion is final: a later copy from the archive does not bring it back.
+            return when {
+                hidden || other.hidden -> merged.asHidden()
+                deleted || other.deleted -> merged.asDeleted()
+                else -> merged
+            }
+        }
+
+        /** Deleted for everyone: no text or data, and never unread. */
+        fun Message.asDeleted(): Message = copy(
+            deleted = true,
+            body = "",
+            payloads = emptyList(),
+            status = if (!outgoing && status == MessageStatus.UNREAD) MessageStatus.READ else status,
+        )
+
+        /** Deleted for me: out of every list, and never unread. */
+        fun Message.asHidden(): Message = copy(
+            hidden = true,
+            status = if (!outgoing && status == MessageStatus.UNREAD) MessageStatus.READ else status,
         )
     }
 }

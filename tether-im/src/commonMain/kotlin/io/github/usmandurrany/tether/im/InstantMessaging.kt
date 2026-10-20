@@ -35,6 +35,14 @@ public data class ChatFeatures(
     val multiDevice: Boolean = true,
     /** The server's message archive (XEP-0313): fills chats on a new device and catches up after being offline. */
     val history: Boolean = true,
+    /** When contacts were last online (XEP-0012), on [TetherChat.contacts] and [TetherChat.conversations]. Needs [presence]. */
+    val lastSeen: Boolean = true,
+    /**
+     * Delete for everyone (XEP-0424): [TetherChat.deleteForEveryone], and
+     * contacts' deletions remove their messages here. With it off, contacts'
+     * deletions are ignored and their messages stay.
+     */
+    val deleteForEveryone: Boolean = true,
 )
 
 /**
@@ -75,6 +83,7 @@ public class InstantMessaging(
     )
     public val history: History = History(client)
     public val push: Push = Push(client)
+    public val lastActivity: LastActivity = LastActivity(client)
 
     init {
         if (features.contacts) client.install(roster)
