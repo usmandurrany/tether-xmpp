@@ -399,7 +399,7 @@ chat.registerPush(PushAppServer.tigase("push.example.com", fcmToken))
 chat.registerPush(PushAppServer.openfire("pubsub.example.com", fcmToken, installId))
 ```
 
-The app server must be yours (or run for your app): a shared one, such as `push.tigase.im` or `p2.siacs.eu`, only holds the keys of its own apps. The account's server reaches it server to server, so it needs a public domain with a valid certificate. Any other app server with an ad-hoc command works through `PushAppServer(jid, command, fields)`.
+The app server must be yours (or run for your app): a shared one, such as `push.tigase.im` or `p2.siacs.eu`, only holds the keys of its own apps. [tether-push](https://github.com/usmandurrany/tether-push) is one you can run: it logs in as an ordinary XMPP account (register `PushAppServer.p2("myapp-push@example.com/push", ...)`), so it needs no domain or certificate, and it deploys to Cloud Run in your Firebase project. Component-style app servers (p2, Tigase, Openfire) are reached server to server instead, so they need a public domain with a valid certificate. Any other app server with an ad-hoc command works through `PushAppServer(jid, command, fields)`.
 
 Watch `chat.pushState`: `Unsupported` means the server has no XEP-0357 support. Tether re-registers on every new login. Call `registerPush` again when FCM gives a new token.
 
