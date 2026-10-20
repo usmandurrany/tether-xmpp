@@ -180,6 +180,49 @@ class XmppSessionTest {
     }
 
     @Test
+    fun gracefulCloseConfirmsWhatCameInBeforeEndingTheStream() = runBlocking<Unit> {
+        val fake = FakeXmppServer(streamManagement = true)
+        val session = opener(fake).live()
+        fake.push("<message from='romeo@localhost'><body>one</body></message>")
+        fake.push("<message from='romeo@localhost'><body>two</body></message>")
+        withTimeout(5_000) { while (session.streamManagement!!.inbound < 2) kotlinx.coroutines.delay(20) }
+        withTimeout(10_000) { session.closeGracefully() }
+        assertEquals(2L, fake.clientAcks.poll(5, TimeUnit.SECONDS), "<a h='2'/> before the close")
+        assertTrue(fake.clientClosedStream)
+    }
+
+    @Test
+    fun theStreamIsNotQuietWhileARequestWaitsForItsAnswer() = runBlocking<Unit> {
+        val fake = FakeXmppServer(streamManagement = true)
+        val session = opener(fake).live()
+        val answer = scope.launch {
+            session.request(
+                element("iq", Ns.CLIENT) {
+                    attribute("type", "get")
+                    attribute("id", "catch-up")
+                    attribute("to", "romeo@localhost")
+                    element("query", "urn:xmpp:mam:2")
+                },
+            )
+        }
+        assertEquals("catch-up", fake.nextFromClient().attribute("id"))
+        assertNull(withTimeoutOrNull(1_000) { session.awaitQuiet(200) }, "the answer is still outstanding")
+        val answered = System.nanoTime()
+        fake.push("<iq type='result' id='catch-up' from='romeo@localhost'/>")
+        withTimeout(5_000) { session.awaitQuiet(300) }
+        assertTrue((System.nanoTime() - answered) / 1_000_000 >= 300, "quiet counts from the answer")
+        answer.join()
+    }
+
+    @Test
+    fun aClosedSessionIsNeverQuiet() = runBlocking<Unit> {
+        val fake = FakeXmppServer(streamManagement = true)
+        val session = opener(fake).live()
+        session.close()
+        assertTrue(runCatching { withTimeout(5_000) { session.awaitQuiet(100) } }.exceptionOrNull() is XmppNegotiationException)
+    }
+
+    @Test
     fun withoutStreamManagementTheProbeIsAPing() = runBlocking<Unit> {
         val fake = FakeXmppServer(streamManagement = false)
         val session = opener(fake).live()

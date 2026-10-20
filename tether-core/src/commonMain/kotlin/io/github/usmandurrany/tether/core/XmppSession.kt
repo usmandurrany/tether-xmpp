@@ -8,6 +8,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.transform
@@ -17,6 +18,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.concurrent.Volatile
 import kotlin.io.encoding.Base64
+import kotlin.time.TimeSource
 
 /** Saved XEP-0198 state. [resumptionId] is null when the session cannot be resumed. */
 internal class SmSnapshot(
@@ -83,6 +85,10 @@ public class XmppSession private constructor(
 
     @Volatile
     private var closed = false
+
+    /** When something last came in or a stanza went out. */
+    @Volatile
+    private var lastActivity = TimeSource.Monotonic.markNow()
 
     /** Stanzas from the server that the app should handle (messages, presence, IQ requests). */
     public val incoming: Flow<Element> = incomingChannel.receiveAsFlow().transform { item ->
@@ -252,11 +258,34 @@ public class XmppSession private constructor(
             if (sm != null && lock.withLock { sm.unackedCount } > 0) {
                 withTimeoutOrNull(2_000) { probe() }
             }
-            lock.withLock { if (!closed) reader.sendStreamClose() }
+            lock.withLock {
+                if (!closed) {
+                    // Confirm what we received, so the server does not treat it as undelivered on close.
+                    if (sm != null) write(element("a", Ns.SM) { attribute("h", sm.inbound.toString()) })
+                    reader.sendStreamClose()
+                }
+            }
             // The server answers with its own </stream:stream>; the read loop then ends.
             if (loopStarted) withTimeoutOrNull(2_000) { ended.await() }
         } finally {
             close()
+        }
+    }
+
+    /**
+     * Returns once, for [quietMillis] in a row, nothing came in, nothing was
+     * sent and no IQ is waiting for its answer. A catch-up query (XEP-0313)
+     * counts as busy until its result arrives, so this also means it is done.
+     * Throws when the session ends first.
+     */
+    override suspend fun awaitQuiet(quietMillis: Long) {
+        require(quietMillis > 0)
+        while (true) {
+            if (closed) throw XmppNegotiationException(NegotiationFailure.CONNECTION_LOST, "Session is closed")
+            val busy = lock.withLock { pendingIqs.isNotEmpty() }
+            val wait = if (busy) minOf(quietMillis, BUSY_POLL_MILLIS) else quietMillis - lastActivity.elapsedNow().inWholeMilliseconds
+            if (!busy && wait <= 0) return
+            delay(wait)
         }
     }
 
@@ -266,6 +295,7 @@ public class XmppSession private constructor(
     }
 
     private suspend fun handle(element: Element) {
+        lastActivity = TimeSource.Monotonic.markNow()
         if (element.namespace == Ns.SM) {
             handleSm(element)
             return
@@ -326,6 +356,7 @@ public class XmppSession private constructor(
     /** Caller holds [lock]. */
     private suspend fun sendLocked(stanza: Element) {
         if (closed) throw XmppNegotiationException(NegotiationFailure.CONNECTION_LOST, "Session is closed")
+        lastActivity = TimeSource.Monotonic.markNow()
         if (sm == null) {
             write(stanza)
             return
@@ -362,6 +393,9 @@ public class XmppSession private constructor(
     }
 
     internal companion object {
+        /** How often [awaitQuiet] looks again while a request is waiting for its answer. */
+        private const val BUSY_POLL_MILLIS = 250L
+
         /**
          * Starts a session: first re-sends what the previous session never got
          * confirmed, then queues stanzas that arrived during negotiation.

@@ -419,10 +419,15 @@ public class TetherChat(
     /**
      * Call when a push notification arrives (from your `FirebaseMessagingService`,
      * say). Connects, also in the background, so waiting messages arrive in
-     * [conversations] and [messages], then closes again after
-     * `ReconnectPolicy.pushWakeMillis` if the app is still in the background.
+     * [conversations] and [messages]. If the app is still in the background it
+     * closes cleanly once the stream goes quiet, or at the latest
+     * `ReconnectPolicy.pushWakeMillis` after the push, inside the short time
+     * the OS lets a background app use the network after a push.
+     *
+     * Pass [elapsedSincePushMillis] when you call this a while after the push
+     * arrived (after restoring a session in a process the push started, say).
      */
-    public suspend fun wakeForPush(): ConnectResult = client.wakeForPush()
+    public suspend fun wakeForPush(elapsedSincePushMillis: Long = 0): ConnectResult = client.wakeForPush(elapsedSincePushMillis)
 
     /** Goes offline, keeping everything for the next [connect]. */
     public suspend fun disconnect(): Unit = client.disconnect()

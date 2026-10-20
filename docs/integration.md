@@ -403,7 +403,9 @@ The app server must be yours (or run for your app): a shared one, such as `push.
 
 Watch `chat.pushState`: `Unsupported` means the server has no XEP-0357 support. Tether re-registers on every new login. Call `registerPush` again when FCM gives a new token.
 
-When a push arrives, call `chat.wakeForPush()` from your `FirebaseMessagingService`. It connects, also when the push started the process, so waiting messages arrive in `conversations`. If the app is still in the background it closes again `ReconnectPolicy.pushWakeMillis` (30 s) after coming online, so the server goes back to pushing. Notify the user from what arrived.
+When a push arrives, call `chat.wakeForPush()` from your `FirebaseMessagingService`. It connects, also when the push started the process, so waiting messages arrive in `conversations`. If the app is still in the background it closes cleanly (`</stream:stream>`) once the stream has been quiet for `ReconnectPolicy.pushQuietMillis` (3 s), or at the latest `ReconnectPolicy.pushWakeMillis` (20 s) after the push, so the server marks the account offline and goes back to pushing. Notify the user from what arrived.
+
+The deadline counts from the push, and more pushes during the wake do not extend it, because Android lets a background app use the network for only about 30 s after a high-priority FCM message. A session still open when Android cuts the socket stays resumable on the server, which then holds new messages without pushing until its resume window ends. If you call `wakeForPush` some time after the push arrived (say after restoring the session in a process the push started), pass the delay: note `SystemClock.elapsedRealtime()` in `onMessageReceived` and call `chat.wakeForPush(elapsedSincePushMillis = SystemClock.elapsedRealtime() - receivedAt)`. A connection lost after the wake came online is not retried until the next push or the foreground.
 
 ## Desktop notes
 
