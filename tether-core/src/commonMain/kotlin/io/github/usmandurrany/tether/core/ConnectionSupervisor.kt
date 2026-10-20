@@ -198,6 +198,7 @@ public class ConnectionSupervisor(
         class Connect(val result: CompletableDeferred<ConnectResult>) : Intent
         class Disconnect(val done: CompletableDeferred<Unit>) : Intent
         data object Wake : Intent
+        data object Check : Intent
         class Network(val available: Boolean, val id: String?, val kind: String?) : Intent
         class AttemptDone(val epoch: Long, val session: LiveSession?, val error: Throwable?) : Intent
         class SessionEnded(val epoch: Long, val cause: Throwable?) : Intent
@@ -291,6 +292,15 @@ public class ConnectionSupervisor(
         intents.trySend(Intent.Foreground(foreground))
     }
 
+    /**
+     * Checks a live session now: the probe gets the usual timeout, and a
+     * session that does not answer is dropped and reconnected, so whatever it
+     * had not confirmed goes out again on the next one. Does nothing offline.
+     */
+    public fun checkConnection() {
+        intents.trySend(Intent.Check)
+    }
+
     /** Stops the actor and closes the session. The supervisor cannot be reused. */
     public fun close() {
         intents.close()
@@ -302,6 +312,7 @@ public class ConnectionSupervisor(
             is Intent.Connect -> onConnect(intent.result)
             is Intent.Disconnect -> onDisconnect(intent.done)
             Intent.Wake -> if (wanted) onWake()
+            Intent.Check -> if (wanted && session != null && _state.value is ConnectionState.Online) probe()
             is Intent.Network -> {
                 networkKind = if (intent.available) intent.kind else null
                 onNetwork(intent.available, intent.id)

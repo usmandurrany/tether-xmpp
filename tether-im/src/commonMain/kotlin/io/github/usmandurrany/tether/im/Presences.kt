@@ -1,3 +1,5 @@
+@file:OptIn(kotlin.time.ExperimentalTime::class)
+
 package io.github.usmandurrany.tether.im
 
 import io.github.usmandurrany.tether.core.BareJid
@@ -14,6 +16,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlin.concurrent.Volatile
+import kotlin.time.Clock
 
 /** RFC 6121 §4.7.2.1. Null means plainly available. */
 public enum class Show(public val wire: String) {
@@ -82,6 +85,14 @@ public class Presences(
     /** Online resources per contact. A contact missing here is offline. */
     public val contacts: StateFlow<Map<BareJid, List<ContactPresence>>> = _contacts.asStateFlow()
 
+    private val _wentOffline = MutableStateFlow<Map<BareJid, Long>>(emptyMap())
+
+    /**
+     * When each contact last went offline while we watched, in milliseconds
+     * since the epoch. For earlier times, ask with [LastActivity].
+     */
+    public val wentOffline: StateFlow<Map<BareJid, Long>> = _wentOffline.asStateFlow()
+
     private val _subscriptions = MutableSharedFlow<SubscriptionEvent>(extraBufferCapacity = 64)
 
     /** Collect before connecting: requests that arrive with no collector are dropped (the server re-sends them on the next login). */
@@ -123,9 +134,15 @@ public class Presences(
                     all + (from to (others + presence))
                 }
             }
-            "unavailable" -> _contacts.update { all ->
-                val left = if (resource == null) emptyList() else all[from].orEmpty().filter { it.resource != resource }
-                if (left.isEmpty()) all - from else all + (from to left)
+            "unavailable" -> {
+                var offline = false
+                _contacts.update { all ->
+                    val left = if (resource == null) emptyList() else all[from].orEmpty().filter { it.resource != resource }
+                    offline = left.isEmpty() && all.containsKey(from)
+                    if (left.isEmpty()) all - from else all + (from to left)
+                }
+                // Their last device left: that is their "last seen".
+                if (offline) _wentOffline.update { it + (from to Clock.System.now().toEpochMilliseconds()) }
             }
             "subscribe" -> _subscriptions.emit(SubscriptionEvent.Requested(from, stanza.child("status", ImNs.CLIENT)?.text))
             "subscribed" -> _subscriptions.emit(SubscriptionEvent.Approved(from))

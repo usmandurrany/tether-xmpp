@@ -273,4 +273,214 @@ class TetherChatTest {
         runCurrent()
         assertEquals(MessageStatus.READ, h.chat.messages(romeo).value.single().status)
     }
+
+    private val linkType = payloadType<String>("link", { put("url", it) }, { string("url") }, namespace = "urn:example:link:0")
+
+    @Test
+    fun payloadsGoOutWithTheMessageAndComeBackOnTheOtherSide() = runTest {
+        val h = harness()
+        val m = h.chat.send(romeo, "Look", linkType.write("https://example.org/a"))
+        assertEquals("https://example.org/a", m.payload(linkType))
+        runCurrent()
+        assertEquals("https://example.org/a", h.sent().single().child("link", "urn:example:link:0")?.child("url")?.text)
+
+        h.incoming(
+            "<message from='romeo@example.net/o' type='chat' id='r1'><body>Back</body>" +
+                "<link xmlns='urn:example:link:0'><url>https://example.org/b</url></link></message>",
+        )
+        runCurrent()
+        val theirs = h.chat.allMessages.value[romeo].orEmpty().single { !it.outgoing }
+        assertEquals("https://example.org/b", theirs.payload(linkType))
+    }
+
+    @Test
+    fun aRetriedMessageKeepsItsPayloads() = runTest {
+        val h = harness()
+        val m = h.chat.send(romeo, "Look", linkType.write("https://example.org/a"))
+        runCurrent()
+        h.incoming("<message from='romeo@example.net' type='error' id='${m.id}'><error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")
+        runCurrent()
+        val failed = h.chat.allMessages.value[romeo].orEmpty().single()
+        assertEquals(MessageStatus.FAILED, failed.status)
+        val again = assertNotNull(h.chat.retry(failed))
+        assertEquals("https://example.org/a", again.payload(linkType))
+    }
+
+    @Test
+    fun simpleDataGoesOutAndComesBack() = runTest {
+        val h = harness()
+        val m = h.chat.send(romeo, "Sunset", MessageData("photo", "url" to "https://img.example/1.jpg", "size" to 48213))
+        assertEquals(48213L, m.data("photo")?.long("size"))
+        runCurrent()
+        assertEquals("https://img.example/1.jpg", h.sent().single().child("photo", MessageData.NAMESPACE)?.child("url")?.text)
+
+        h.incoming(
+            "<message from='romeo@example.net/o' type='chat' id='r1'><body>Mine</body>" +
+                "<photo xmlns='urn:tether:data:0'><url>https://img.example/2.jpg</url><width>800</width></photo></message>",
+        )
+        runCurrent()
+        val theirs = h.chat.allMessages.value[romeo].orEmpty().single { !it.outgoing }
+        assertEquals(800, theirs.data("photo")?.int("width"))
+    }
+
+    @Test
+    fun deleteForEveryoneEmptiesOurMessageAndTellsTheContact() = runTest {
+        val h = harness()
+        val m = h.chat.send(romeo, "oops", MessageData("photo", "url" to "u"))
+        runCurrent()
+        assertTrue(h.chat.deleteForEveryone(m))
+        runCurrent()
+        val shown = h.chat.allMessages.value[romeo].orEmpty().single()
+        assertTrue(shown.deleted)
+        assertEquals("", shown.body)
+        assertTrue(shown.payloads.isEmpty())
+        assertEquals(m.id, h.sent().last().child("retract", ImNs.RETRACT)?.attribute("id"))
+    }
+
+    @Test
+    fun onlyTheSenderCanDeleteTheirMessage() = runTest {
+        val h = harness()
+        h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>one</body></message>")
+        runCurrent()
+        val theirs = h.chat.allMessages.value[romeo].orEmpty().single()
+        assertFalse(h.chat.deleteForEveryone(theirs), "not ours")
+        // Someone else's retraction of Romeo's message does nothing.
+        h.incoming("<message from='mallory@evil.example/x' type='chat'><retract xmlns='urn:xmpp:message-retract:1' id='r1'/><body>f</body></message>")
+        runCurrent()
+        assertFalse(h.chat.allMessages.value[romeo].orEmpty().single().deleted)
+        // Romeo's own does.
+        h.incoming("<message from='romeo@example.net/o' type='chat'><retract xmlns='urn:xmpp:message-retract:1' id='r1'/><body>f</body></message>")
+        runCurrent()
+        val after = h.chat.allMessages.value[romeo].orEmpty().single()
+        assertTrue(after.deleted)
+        assertEquals(MessageStatus.READ, after.status, "a deleted message is not unread")
+        assertEquals(0, h.chat.unreadCount.value)
+    }
+
+    @Test
+    fun aDeletionThatArrivesFirstStillApplies() = runTest {
+        val h = harness()
+        h.chat.importPage(
+            HistoryPage(emptyList(), null, null, true, retractions = listOf(ArchivedRetraction(romeo, "r1", outgoing = false))),
+            unread = false,
+        )
+        h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>late copy</body></message>")
+        runCurrent()
+        assertTrue(h.chat.allMessages.value[romeo].orEmpty().single().deleted)
+    }
+
+    @Test
+    fun deletionsCanBeSwitchedOff() = runTest {
+        val h = harness(ChatFeatures(deleteForEveryone = false))
+        h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>one</body></message>")
+        h.incoming("<message from='romeo@example.net/o' type='chat'><retract xmlns='urn:xmpp:message-retract:1' id='r1'/><body>f</body></message>")
+        runCurrent()
+        val list = h.chat.allMessages.value[romeo].orEmpty()
+        assertEquals(listOf("one"), list.map { it.body }, "kept, and no fallback text shown")
+        assertFalse(h.chat.deleteForEveryone(h.chat.send(romeo, "x")))
+    }
+
+    @Test
+    fun deleteForMeHidesItAndTheArchiveCannotBringItBack() = runTest {
+        val h = harness()
+        h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>one</body></message>")
+        runCurrent()
+        h.chat.deleteForMe(h.chat.allMessages.value[romeo].orEmpty().single())
+        // Gone at once, with no dispatch in between.
+        assertTrue(h.chat.allMessages.value[romeo].orEmpty().isEmpty())
+        runCurrent()
+        assertEquals(0, h.chat.unreadCount.value)
+        h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>one</body></message>")
+        runCurrent()
+        assertTrue(h.chat.allMessages.value[romeo].orEmpty().isEmpty())
+        assertTrue(h.chat.conversations.value.isEmpty())
+    }
+
+    @Test
+    fun aContactWhoGoesOfflineShowsWhenTheyWereLastSeen() = runTest {
+        val h = harness()
+        h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>hi</body></message>")
+        h.chat.im.presences.onStanza(xml("<presence from='romeo@example.net/o'/>"))
+        runCurrent()
+        assertNull(h.chat.conversations.value.single().lastSeen, "online: no last seen")
+        h.chat.im.presences.onStanza(xml("<presence from='romeo@example.net/o' type='unavailable'/>"))
+        runCurrent()
+        assertNotNull(h.chat.conversations.value.single().lastSeen)
+        assertFalse(h.chat.conversations.value.single().online)
+    }
+
+    private class MemoryStore : MessageStore {
+        val rows = LinkedHashMap<String, Message>()
+        override suspend fun load() = rows.values.toList()
+        override suspend fun save(messages: List<Message>) { messages.forEach { rows[MessageCodec.keyOf(it)] = it } }
+        override suspend fun delete(messages: List<Message>) { messages.forEach { rows.remove(MessageCodec.keyOf(it)) } }
+        override suspend fun clear() { rows.clear() }
+    }
+
+    @Test
+    fun theStoreKeepsTicksAndLoadsThemBack() = runTest {
+        val store = MemoryStore()
+        val negotiator = StreamNegotiator(
+            XmppConfig(BareJid.parse("juliet@example.com"), password = "x"),
+            object : XmppTransportFactory {
+                override suspend fun connect(endpoint: Endpoint, serverName: String): XmppTransport = error("offline test")
+            },
+            EndpointResolver({ emptyList() }),
+        )
+        val client = XmppClient(negotiator, backgroundScope)
+        val chat = TetherChat(client, ChatFeatures(), messageStore = store)
+        chat.im.messaging.onSessionStarted(FakeSession(FakeSender()))
+        runCurrent()
+        val m = chat.send(romeo, "hi")
+        runCurrent()
+        chat.im.messaging.onStanza(xml("<message from='romeo@example.net/o'><received xmlns='urn:xmpp:receipts' id='${m.id}'/></message>"))
+        runCurrent()
+        assertEquals(MessageStatus.DELIVERED, store.rows.values.single().status)
+
+        // A new chat on the same store starts with what was saved.
+        val again = TetherChat(XmppClient(negotiator, backgroundScope), ChatFeatures(), messageStore = store)
+        runCurrent()
+        assertEquals(MessageStatus.DELIVERED, again.allMessages.value[romeo].orEmpty().single().status)
+    }
+
+    @Test
+    fun retryRemovesTheFailedCopyFromTheStore() = runTest {
+        val store = MemoryStore()
+        val negotiator = StreamNegotiator(
+            XmppConfig(BareJid.parse("juliet@example.com"), password = "x"),
+            object : XmppTransportFactory {
+                override suspend fun connect(endpoint: Endpoint, serverName: String): XmppTransport = error("offline test")
+            },
+            EndpointResolver({ emptyList() }),
+        )
+        val chat = TetherChat(XmppClient(negotiator, backgroundScope), ChatFeatures(), messageStore = store)
+        chat.im.messaging.onSessionStarted(FakeSession(FakeSender()))
+        runCurrent()
+        val m = chat.send(romeo, "hi")
+        runCurrent()
+        chat.im.messaging.onStanza(xml("<message from='romeo@example.net' type='error' id='${m.id}'><error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>"))
+        runCurrent()
+        val again = assertNotNull(chat.retry(chat.allMessages.value[romeo].orEmpty().single()))
+        runCurrent()
+        assertEquals(listOf(again.id), store.rows.values.map { it.id })
+    }
+
+    @Test
+    fun contactRequestsWaitForAnAnswerByDefault() = runTest {
+        val h = harness()
+        h.chat.im.presences.onStanza(xml("<presence from='romeo@example.net' type='subscribe'/>"))
+        runCurrent()
+        assertEquals(setOf(romeo), h.chat.contactRequests.value)
+        assertTrue(h.sent().none { it.name == "presence" && it.attribute("to") == "romeo@example.net" })
+    }
+
+    @Test
+    fun autoAcceptApprovesAndAsksBack() = runTest {
+        val h = harness(ChatFeatures(autoAcceptContacts = true))
+        h.chat.im.presences.onStanza(xml("<presence from='romeo@example.net' type='subscribe'/>"))
+        runCurrent()
+        assertTrue(h.chat.contactRequests.value.isEmpty())
+        val answers = h.sent().filter { it.name == "presence" && it.attribute("to") == "romeo@example.net" }.map { it.attribute("type") }
+        assertEquals(listOf("subscribed", "subscribe"), answers)
+    }
 }

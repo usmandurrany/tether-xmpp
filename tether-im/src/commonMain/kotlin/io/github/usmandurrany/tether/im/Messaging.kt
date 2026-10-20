@@ -53,7 +53,10 @@ public data class ChatMessage(
     val stanza: Element,
     /** The sender asked for read markers (XEP-0333): answer with [Messaging.markDisplayed] once it is shown. */
     val markable: Boolean = false,
-)
+) {
+    /** The app's own elements in the message, such as a picture's details; read them with a [PayloadType]. */
+    val payloads: List<Element> get() = Payloads.of(stanza)
+}
 
 /** What happens to messages. */
 public sealed interface MessageEvent {
@@ -83,6 +86,14 @@ public sealed interface MessageEvent {
 
     /** A contact started or stopped typing (XEP-0085). */
     public data class ChatStateChanged(val peer: BareJid, val state: ChatState) : MessageEvent
+
+    /**
+     * A message was deleted for everyone (XEP-0424). With [outgoing] false, the
+     * contact [peer] deleted their message [id]; with it true, we deleted ours
+     * to [peer] on another device. Only the message's own sender can delete it:
+     * apply it only to messages in that direction with [peer].
+     */
+    public data class Retracted(val peer: BareJid, val id: String, val outgoing: Boolean) : MessageEvent
 }
 
 /**
@@ -129,6 +140,10 @@ public class Messaging(
     /**
      * Sends a chat message and returns its id. Returns once it is on its way;
      * [MessageEvent.SentToServer] and [MessageEvent.Delivered] follow.
+     *
+     * [payloads] go in the same stanza, after the body. [body] is what clients
+     * that do not know them show, so make it a useful fallback: a caption, or
+     * the link itself.
      */
     public suspend fun send(
         to: BareJid,
@@ -137,7 +152,10 @@ public class Messaging(
         thread: String? = null,
         requestReceipt: Boolean = requestReceipts,
         markable: Boolean = this.markable,
+        /** The app's own elements, sent beside the body; see [PayloadType]. */
+        payloads: List<Element> = emptyList(),
     ): String {
+        Payloads.requireSendable(payloads)
         client.send(
             element("message", ImNs.CLIENT) {
                 attribute("to", to.toString())
@@ -149,6 +167,9 @@ public class Messaging(
                 if (requestReceipt) element("request", ImNs.RECEIPTS)
                 if (markable) element("markable", ImNs.MARKERS)
                 if (chatStates) element("active", ImNs.CHAT_STATES)
+                payloads.forEach(::child)
+                // Servers may skip archiving a message with an empty body; data alone is still worth keeping.
+                if (body.isEmpty() && payloads.isNotEmpty()) element("store", ImNs.HINTS)
             },
         )
         return id
@@ -167,6 +188,26 @@ public class Messaging(
                 attribute("type", "chat")
                 element("displayed", ImNs.MARKERS) { attribute("id", id) }
                 thread?.let { element("thread") { text(it) } }
+                element("store", ImNs.HINTS)
+            },
+        )
+    }
+
+    /**
+     * Deletes our message [id] for everyone (XEP-0424): the contact's apps that
+     * support it remove it, and the server may remove it from the archive.
+     * Apps that do not support it show a short note instead. [id] is the id
+     * the message was sent with.
+     */
+    public suspend fun retract(to: BareJid, id: String) {
+        client.send(
+            element("message", ImNs.CLIENT) {
+                attribute("to", to.toString())
+                attribute("type", "chat")
+                attribute("id", newId())
+                element("retract", ImNs.RETRACT) { attribute("id", id) }
+                element("fallback", ImNs.FALLBACK) { attribute("for", ImNs.RETRACT) }
+                element("body") { text(RETRACT_FALLBACK) }
                 element("store", ImNs.HINTS)
             },
         )
@@ -221,6 +262,13 @@ public class Messaging(
             if (!outgoing) _events.emit(MessageEvent.Delivered(peer, receipt))
             return true
         }
+        if (type != "groupchat") {
+            // Before the body check: a retraction carries a fallback body for older clients.
+            retractedIdOf(message)?.let { retracted ->
+                _events.emit(MessageEvent.Retracted(peer, retracted, outgoing))
+                return true
+            }
+        }
         val state = ChatState.of(message)
         if (type != "groupchat") {
             markerOf(message)?.let { (marker, markedId) ->
@@ -269,6 +317,13 @@ public class Messaging(
         }
 
         private val MARKERS = setOf("received", "displayed", "acknowledged")
+
+        /** The id of the message a XEP-0424 retraction deletes, or null when [message] is not one. */
+        fun retractedIdOf(message: Element): String? = message.child("retract", ImNs.RETRACT)?.attribute("id")
+
+        /** The body older clients show for a retraction (the text XEP-0424 suggests). */
+        const val RETRACT_FALLBACK: String =
+            "This person attempted to retract a previous message, but it's unsupported by your client."
     }
 }
 

@@ -92,4 +92,31 @@ class HistoryTest {
             page.markers,
         )
     }
+
+    @Test
+    fun archivedRetractionsAndTombstonesComeWithThePage() = runTest {
+        lateinit var history: History
+        val sender = FakeSender()
+        history = History(sender)
+        sender.answer = { iq ->
+            val qid = iq.child("query", ImNs.MAM)!!.attribute("queryid")
+            listOf(
+                // Romeo deleted his message r1; the retraction carries a fallback body.
+                "<message xmlns='jabber:client' from='romeo@example.net/o' to='juliet@example.com/phone' type='chat'><retract xmlns='urn:xmpp:message-retract:1' id='r1'/><fallback xmlns='urn:xmpp:fallback:0' for='urn:xmpp:message-retract:1'/><body>fallback</body></message>",
+                // The server replaced our deleted message m1 with a tombstone.
+                "<message xmlns='jabber:client' from='juliet@example.com/laptop' to='romeo@example.net' type='chat' id='m1'><retracted xmlns='urn:xmpp:message-retract:1' stamp='2026-10-20T10:00:00Z'/></message>",
+                "<message xmlns='jabber:client' from='romeo@example.net/o' to='juliet@example.com/phone' type='chat' id='r2'><body>kept</body></message>",
+            ).forEachIndexed { i, inner ->
+                history.onStanza(xml("<message from='juliet@example.com'><result xmlns='urn:xmpp:mam:2' queryid='$qid' id='a$i'><forwarded xmlns='urn:xmpp:forward:0'>$inner</forwarded></result></message>"))
+            }
+            xml("<iq type='result' id='${iq.attribute("id")}'><fin xmlns='urn:xmpp:mam:2' complete='true'/></iq>")
+        }
+        history.onSessionStarted(FakeSession(sender, accountFeatures = setOf(ImNs.MAM)))
+        val page = history.fetch(with = romeo)
+        assertEquals(listOf("kept"), page.messages.map { it.body })
+        assertEquals(
+            listOf(ArchivedRetraction(romeo, "r1", outgoing = false), ArchivedRetraction(romeo, "m1", outgoing = true)),
+            page.retractions,
+        )
+    }
 }

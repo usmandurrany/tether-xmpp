@@ -11,11 +11,14 @@ import io.github.usmandurrany.tether.core.KeyValueStore
 import io.github.usmandurrany.tether.core.OutboxFullException
 import io.github.usmandurrany.tether.core.SessionContext
 import io.github.usmandurrany.tether.core.XmppClient
+import io.github.usmandurrany.tether.xml.Element
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -75,6 +78,23 @@ public data class Message(
     val markable: Boolean = false,
     /** Ours, but sent from another of our devices. */
     val fromOtherDevice: Boolean = false,
+    /**
+     * Deleted for everyone, by us or by the contact (XEP-0424). Its text and
+     * data are gone; show a placeholder such as "This message was deleted".
+     */
+    val deleted: Boolean = false,
+    /**
+     * Deleted for me ([TetherChat.deleteForMe]). Never in the SDK's lists; kept
+     * so a [MessageStore] remembers it and the archive cannot bring it back.
+     */
+    val hidden: Boolean = false,
+    /**
+     * The app's own data sent with the message, such as a picture's link and
+     * size. Read it with `message.data("photo")`, or `message.payload(PhotoType)`
+     * for a [PayloadType].
+     * A [MessageStore] can keep these as one string with [Payloads.toXml].
+     */
+    val payloads: List<Element> = emptyList(),
 )
 
 /** One entry of the chat list. */
@@ -87,6 +107,8 @@ public data class Conversation(
     /** The contact is typing right now. */
     val typing: Boolean,
     val online: Boolean,
+    /** When the contact was last online, in milliseconds since the epoch; null while online or when unknown. */
+    val lastSeen: Long? = null,
 )
 
 /** One entry of the contact list, with what we know of their presence. */
@@ -103,12 +125,21 @@ public data class Contact(
     /** We asked to see their presence and they have not answered yet. */
     val pending: Boolean,
     val groups: Set<String>,
+    /** When they were last online, in milliseconds since the epoch; null while online or when unknown. */
+    val lastSeen: Long? = null,
 )
 
 /**
- * Where [TetherChat] keeps messages between runs: back it with Room,
- * SQLDelight or a file. Without one, messages live in memory and chats are
- * refilled from the server archive after a restart.
+ * Where [TetherChat] keeps messages between runs, so ticks, read state,
+ * deletions and custom data survive a restart. `TetherAndroid.chat` and
+ * `TetherJvm.chat` use a built-in one (SQLite on Android, a file on the
+ * desktop); pass your own to use Room, SQLDelight or anything else, or null
+ * to keep messages in memory only.
+ *
+ * The SDK does all the logic: a store only keeps rows. A message's identity
+ * is [Message.peer], [Message.outgoing] and [Message.id] together;
+ * [MessageCodec] turns a whole message into one string, and
+ * [MessageStoreCheck] tests an implementation.
  */
 public interface MessageStore {
     /** Every saved message, in any order. */
@@ -116,6 +147,9 @@ public interface MessageStore {
 
     /** Adds the messages, or replaces those with the same [Message.peer], [Message.outgoing] and [Message.id]. */
     public suspend fun save(messages: List<Message>)
+
+    /** Removes these messages (matched by peer, outgoing and id), such as a failed message that was sent again. */
+    public suspend fun delete(messages: List<Message>)
 
     /** Forgets every message, on sign-out. */
     public suspend fun clear()
@@ -191,9 +225,21 @@ public class TetherChat(
     private val typingTokens = MutableStateFlow<Map<BareJid, Long>>(emptyMap())
     private val openChats = MutableStateFlow<Set<BareJid>>(emptySet())
     private val requests = MutableStateFlow<Set<BareJid>>(emptySet())
+    private val askedLastSeen = MutableStateFlow<Map<BareJid, Long>>(emptyMap())
+
+    /** Deletions that arrived before the message they delete: (peer, outgoing, id). */
+    private val pendingRetractions = MutableStateFlow<Set<Triple<BareJid, Boolean, String>>>(emptySet())
 
     /** Every message, per contact, oldest first. */
-    public val allMessages: StateFlow<Map<BareJid, List<Message>>> = threads.asStateFlow()
+    public val allMessages: StateFlow<Map<BareJid, List<Message>>> =
+        // Derived without a coroutine, so `.value` is up to date the moment a call such as deleteForMe returns.
+        MappedStateFlow(threads) { all -> all.mapValues { (_, list) -> list.filterNot { it.hidden } } }
+
+    /** When each offline contact was last online, as far as we know. */
+    private val lastSeenTimes: StateFlow<Map<BareJid, Long>> =
+        combine(askedLastSeen, im.presences.wentOffline) { asked, watched ->
+            (asked.keys + watched.keys).associateWith { maxOf(asked[it] ?: 0, watched[it] ?: 0) }
+        }.stateIn(scope, SharingStarted.Eagerly, emptyMap())
 
     /** Contacts typing right now. */
     public val typingContacts: StateFlow<Set<BareJid>> =
@@ -201,7 +247,7 @@ public class TetherChat(
 
     /** The chat list, most recent first. */
     public val conversations: StateFlow<List<Conversation>> =
-        combine(threads, typingContacts, im.roster.items, im.presences.contacts) { all, typing, roster, online ->
+        combine(allMessages, typingContacts, im.roster.items, im.presences.contacts, lastSeenTimes) { all, typing, roster, online, seen ->
             all.filterValues { it.isNotEmpty() }.map { (peer, messages) ->
                 Conversation(
                     peer = peer,
@@ -210,18 +256,19 @@ public class TetherChat(
                     unreadCount = messages.count { it.status == MessageStatus.UNREAD },
                     typing = peer in typing,
                     online = !online[peer].isNullOrEmpty(),
+                    lastSeen = if (features.lastSeen && online[peer].isNullOrEmpty()) seen[peer] else null,
                 )
             }.sortedByDescending { it.lastMessage?.timestamp ?: 0 }
         }.stateIn(scope, SharingStarted.Eagerly, emptyList())
 
     /** Unread messages in every chat, for an app badge. */
     public val unreadCount: StateFlow<Int> =
-        threads.map { all -> all.values.sumOf { list -> list.count { it.status == MessageStatus.UNREAD } } }
+        allMessages.map { all -> all.values.sumOf { list -> list.count { it.status == MessageStatus.UNREAD } } }
             .distinctUntilChanged().stateIn(scope, SharingStarted.Eagerly, 0)
 
     /** The contact list, sorted by name. Empty when [ChatFeatures.contacts] is off. */
     public val contacts: StateFlow<List<Contact>> =
-        combine(im.roster.items, im.presences.contacts) { roster, online ->
+        combine(im.roster.items, im.presences.contacts, lastSeenTimes) { roster, online, seen ->
             roster.values.map { item ->
                 val best = online[item.jid].orEmpty().maxByOrNull { it.priority }
                 Contact(
@@ -233,16 +280,21 @@ public class TetherChat(
                     subscription = item.subscription,
                     pending = item.pendingOut,
                     groups = item.groups,
+                    lastSeen = if (features.lastSeen && best == null) seen[item.jid] else null,
                 )
             }.sortedBy { it.name.lowercase() }
         }.stateIn(scope, SharingStarted.Eagerly, emptyList())
 
-    /** People asking to see our presence: answer with [approve] or [deny]. */
+    /**
+     * People asking to see our presence: answer with [approve] or [deny].
+     * Stays empty with [ChatFeatures.autoAcceptContacts] on, since every request is accepted at once.
+     */
     public val contactRequests: StateFlow<Set<BareJid>> = requests.asStateFlow()
 
     /** Outgoing work (messages, markers, typing), one at a time, so it goes out in order. */
     private val work = Channel<suspend () -> Unit>(Channel.UNLIMITED)
-    private val saves = Channel<Message>(Channel.UNLIMITED)
+    /** Store writes, in order: a message to save, or (with `true`) one to delete. */
+    private val saves = Channel<Pair<Message, Boolean>>(Channel.UNLIMITED)
 
     // Typing we send, touched only from the work queue.
     private val composing = HashSet<BareJid>()
@@ -261,7 +313,12 @@ public class TetherChat(
         scope.launch(start = CoroutineStart.UNDISPATCHED) {
             im.presences.subscriptions.collect { event ->
                 when (event) {
-                    is SubscriptionEvent.Requested -> requests.update { it + event.from }
+                    is SubscriptionEvent.Requested ->
+                        if (features.autoAcceptContacts) {
+                            scope.launch { runCatching { approve(event.from) } }
+                        } else {
+                            requests.update { it + event.from }
+                        }
                     else -> requests.update { it - event.from }
                 }
             }
@@ -281,9 +338,18 @@ public class TetherChat(
             scope.launch {
                 runCatching { messageStore.load() }.getOrNull()?.let { merge(it) { old, new -> old.mergedWith(new) } }
                 for (first in saves) {
-                    val batch = arrayListOf(first)
-                    while (true) batch += saves.tryReceive().getOrNull() ?: break
-                    runCatching { messageStore.save(batch) }
+                    val ops = arrayListOf(first)
+                    while (true) ops += saves.tryReceive().getOrNull() ?: break
+                    // Consecutive saves (or deletes) go in one call; the order between them is kept.
+                    var i = 0
+                    while (i < ops.size) {
+                        val delete = ops[i].second
+                        var j = i
+                        while (j < ops.size && ops[j].second == delete) j++
+                        val batch = ops.subList(i, j).map { it.first }
+                        runCatching { if (delete) messageStore.delete(batch) else messageStore.save(batch) }
+                        i = j
+                    }
                 }
             }
         }
@@ -330,14 +396,34 @@ public class TetherChat(
 
     /** One chat's messages, oldest first. */
     public fun messages(peer: BareJid): StateFlow<List<Message>> =
-        threads.map { it[peer].orEmpty() }.distinctUntilChanged()
-            .stateIn(scope, SharingStarted.WhileSubscribed(), threads.value[peer].orEmpty())
+        allMessages.map { it[peer].orEmpty() }.distinctUntilChanged()
+            .stateIn(scope, SharingStarted.WhileSubscribed(), allMessages.value[peer].orEmpty())
+
+    /**
+     * Sends [text] with the app's own [data], such as
+     * `MessageData("photo", "url" to url, "size" to 48213)`, with the caption as
+     * [text]. Read it on the other side with `message.data("photo")`.
+     *
+     * [text] may be empty when the data says it all, but it is what other XMPP
+     * apps show, so a caption or a link is a better fallback.
+     */
+    public fun send(to: BareJid, text: String, data: MessageData, vararg more: MessageData): Message =
+        send(to, text, data.toElement(), *more.map(MessageData::toElement).toTypedArray())
 
     /**
      * Sends [text] to [to] and returns the message at once, as SENDING. Works
      * offline: it waits on the device and goes out on the next connection.
+     *
+     * [payloads] carry the app's own data in the same message: the simplest is
+     * the [MessageData] overload; `PhotoType.write(photo)` from a [PayloadType]
+     * goes here.
+     *
+     * Throws [IllegalArgumentException] when a payload uses a namespace the
+     * SDK reserves.
      */
-    public fun send(to: BareJid, text: String): Message {
+    public fun send(to: BareJid, text: String, vararg payloads: Element): Message {
+        val extra = payloads.toList()
+        Payloads.requireSendable(extra)
         val message = Message(
             id = newId(),
             peer = to,
@@ -346,12 +432,13 @@ public class TetherChat(
             timestamp = now(),
             status = MessageStatus.SENDING,
             markable = features.readMarkers,
+            payloads = extra,
         )
         merge(listOf(message)) { old, _ -> old }
         work.trySend {
             stopComposing(to)
             try {
-                im.messaging.send(to, text, id = message.id)
+                im.messaging.send(to, text, id = message.id, payloads = extra)
                 // Without stream management the server never confirms, so on its way is the best we know.
                 val session = client.session.value
                 if (session != null && session.streamManagement == null) setStatus(message.id, MessageStatus.SENT)
@@ -363,13 +450,13 @@ public class TetherChat(
     }
 
     /**
-     * Sends a failed message again, as a new message with the same text. The
-     * failed one is removed.
+     * Sends a failed message again, as a new message with the same text and
+     * payloads. The failed one is removed.
      */
     public fun retry(message: Message): Message? {
         if (!message.outgoing || message.status != MessageStatus.FAILED) return null
         remove(message)
-        return send(message.peer, message.body)
+        return send(message.peer, message.body, *message.payloads.toTypedArray())
     }
 
     /**
@@ -381,6 +468,53 @@ public class TetherChat(
     public fun openChat(peer: BareJid) {
         openChats.update { it + peer }
         if (features.history) scope.launch { runCatching { loadNewest(peer) } }
+        if (features.lastSeen && features.presence) scope.launch { runCatching { refreshLastSeen(peer) } }
+    }
+
+    /**
+     * Asks the server when [peer] was last online, and returns it in
+     * milliseconds since the epoch: null while they are online, or when their
+     * server does not say (it only tells contacts who may see their presence).
+     * [openChat] does this for you; [contacts] and [conversations] then show it.
+     */
+    public suspend fun lastSeen(peer: BareJid): Long? {
+        if (!features.lastSeen) return null
+        refreshLastSeen(peer)
+        return if (im.presences.contacts.value[peer].isNullOrEmpty()) lastSeenTimes.value[peer] else null
+    }
+
+    private suspend fun refreshLastSeen(peer: BareJid) {
+        awaitOnline()
+        if (!im.presences.contacts.value[peer].isNullOrEmpty()) return
+        val seen = im.lastActivity.lastSeen(peer) ?: return
+        askedLastSeen.update { it + (peer to seen) }
+    }
+
+    /**
+     * Deletes our [message] for everyone (XEP-0424). It stays in the chat as
+     * [Message.deleted], with no text, here and on our other devices; the
+     * contact's app removes it if it supports deletion, and shows a short note
+     * otherwise. Returns false for a message that is not ours, or when
+     * [ChatFeatures.deleteForEveryone] is off.
+     */
+    public fun deleteForEveryone(message: Message): Boolean {
+        if (!features.deleteForEveryone || !message.outgoing) return false
+        markDeleted(message.peer, message.id, outgoing = true)
+        work.trySend { im.messaging.retract(message.peer, message.id) }
+        return true
+    }
+
+    /**
+     * Deletes [message] on this device only: it leaves the lists and does not
+     * come back from the archive (as long as the [MessageStore] keeps it, when
+     * there is one). The contact still has it.
+     */
+    public fun deleteForMe(message: Message) {
+        update(message.peer) { list ->
+            list.map { m ->
+                if (m.id == message.id && m.outgoing == message.outgoing) m.asHidden() else m
+            }
+        }
     }
 
     /** The chat with [peer] left the screen. */
@@ -481,6 +615,7 @@ public class TetherChat(
             is MessageEvent.Delivered -> setStatus(event.id, MessageStatus.DELIVERED, peer = event.peer)
             is MessageEvent.Displayed -> if (features.readMarkers) markUpTo(event.peer, event.id, outgoing = true)
             is MessageEvent.DisplayedElsewhere -> markUpTo(event.peer, event.id, outgoing = false)
+            is MessageEvent.Retracted -> if (features.deleteForEveryone) markDeleted(event.peer, event.id, event.outgoing)
             is MessageEvent.Failed -> setStatus(event.id, MessageStatus.FAILED, peer = event.peer, error = event.condition ?: "error")
             is MessageEvent.ChatStateChanged -> if (features.typingIndicators) {
                 if (event.state == ChatState.COMPOSING) {
@@ -541,8 +676,25 @@ public class TetherChat(
         }
     }
 
+    /** Deletes a message for everyone; remembers the deletion when the message has not arrived yet. */
+    private fun markDeleted(peer: BareJid, id: String, outgoing: Boolean) {
+        var found = false
+        update(peer) { list ->
+            list.map { m ->
+                if (m.id == id && m.outgoing == outgoing) {
+                    found = true
+                    m.asDeleted()
+                } else {
+                    m
+                }
+            }
+        }
+        if (!found) pendingRetractions.update { it + Triple(peer, outgoing, id) }
+    }
+
     private fun remove(message: Message) {
         update(message.peer) { list -> list.filterNot { it.id == message.id && it.outgoing == message.outgoing } }
+        if (messageStore != null) saves.trySend(message to true)
     }
 
     /** Changes one chat and saves what changed. */
@@ -554,12 +706,18 @@ public class TetherChat(
             changed = if (after === before || messageStore == null) emptyList() else after.filter { it !in before }
             if (after === before) all else all + (peer to after)
         }
-        changed.forEach { saves.trySend(it) }
+        changed.forEach { saves.trySend(it to false) }
     }
 
     /** Adds [incoming] messages, combining each with one already known through [combine]. */
     private fun merge(incoming: List<Message>, combine: (old: Message, new: Message) -> Message) {
-        for ((peer, batch) in incoming.groupBy { it.peer }) {
+        val arrived = incoming.map { m ->
+            val key = Triple(m.peer, m.outgoing, m.id)
+            var deleted = false
+            pendingRetractions.update { pending -> deleted = key in pending; if (deleted) pending - key else pending }
+            if (deleted) m.asDeleted() else m
+        }
+        for ((peer, batch) in arrived.groupBy { it.peer }) {
             update(peer) { list ->
                 var result = list
                 for (m in batch) {
@@ -619,6 +777,7 @@ public class TetherChat(
 
     internal fun importPage(page: HistoryPage, unread: Boolean) {
         merge(page.messages.mapNotNull { it.toMessage(unread) }) { old, new -> old.mergedWith(new) }
+        if (features.deleteForEveryone) page.retractions.forEach { markDeleted(it.peer, it.id, it.outgoing) }
         for (marker in page.markers) {
             when {
                 // The contact read or got ours.
@@ -652,6 +811,7 @@ public class TetherChat(
             thread = thread,
             markable = markable,
             fromOtherDevice = outgoing && carbon,
+            payloads = payloads,
         )
     }
 
@@ -712,10 +872,63 @@ public class TetherChat(
          * keep what we knew, add what is new. Only a read marker, never a copy,
          * makes one of theirs read: otherwise we would not tell them we read it.
          */
-        fun Message.mergedWith(other: Message): Message = (if (outgoing) raisedTo(other.status) else this).copy(
-            serverId = serverId ?: other.serverId,
-            markable = markable || other.markable,
-            thread = thread ?: other.thread,
+        fun Message.mergedWith(other: Message): Message {
+            val merged = (if (outgoing) raisedTo(other.status) else this).copy(
+                serverId = serverId ?: other.serverId,
+                markable = markable || other.markable,
+                thread = thread ?: other.thread,
+                payloads = payloads.ifEmpty { other.payloads },
+            )
+            // A deletion is final: a later copy from the archive does not bring it back.
+            return when {
+                hidden || other.hidden -> merged.asHidden()
+                deleted || other.deleted -> merged.asDeleted()
+                else -> merged
+            }
+        }
+
+        /** Deleted for everyone: no text or data, and never unread. */
+        fun Message.asDeleted(): Message = copy(
+            deleted = true,
+            body = "",
+            payloads = emptyList(),
+            status = if (!outgoing && status == MessageStatus.UNREAD) MessageStatus.READ else status,
         )
+
+        /** Deleted for me: out of every list, and never unread. */
+        fun Message.asHidden(): Message = copy(
+            hidden = true,
+            status = if (!outgoing && status == MessageStatus.UNREAD) MessageStatus.READ else status,
+        )
+    }
+}
+
+/**
+ * [source] passed through [transform] on read, with no coroutine in between:
+ * the value never lags behind the source. The last result is cached per
+ * source value, so reading it again is free.
+ */
+@OptIn(ExperimentalForInheritanceCoroutinesApi::class)
+private class MappedStateFlow<T, R>(
+    private val source: StateFlow<T>,
+    private val transform: (T) -> R,
+) : StateFlow<R> {
+    private class Cached<T, R>(val from: T, val result: R)
+
+    @Volatile
+    private var cache: Cached<T, R>? = null
+
+    override val value: R
+        get() {
+            val current = source.value
+            cache?.let { if (it.from === current) return it.result }
+            return transform(current).also { cache = Cached(current, it) }
+        }
+
+    override val replayCache: List<R> get() = listOf(value)
+
+    override suspend fun collect(collector: FlowCollector<R>): Nothing {
+        source.map { value }.distinctUntilChanged().collect(collector)
+        error("a StateFlow never completes")
     }
 }

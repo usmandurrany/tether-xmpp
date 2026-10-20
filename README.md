@@ -13,6 +13,7 @@ val chat = TetherAndroid.chat(context, BareJid.parse("alice@example.com"), passw
 chat.connect()
 chat.conversations.collect { render(it) }   // chat list with unread counts and typing
 chat.send(bob, "Hi Bob")                    // ticks, read receipts, offline queue: handled
+chat.send(bob, "Sunset", MessageData("photo", "url" to url, "size" to 48213))   // your own data, read with message.data("photo")
 ```
 
 ## Probing a server
