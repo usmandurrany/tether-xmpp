@@ -150,9 +150,76 @@ By default messages live in memory. After a restart, recent chats are rebuilt fr
 val chat = TetherAndroid.chat(context, jid, password, messageStore = RoomMessageStore(db))
 ```
 
-`save` receives every new or changed message; replace by `peer`, `outgoing` and `id`.
+`save` receives every new or changed message; replace by `peer`, `outgoing` and `id`. Keep a message's custom data (below) in one text column with `Payloads.toXml(message.payloads)`, and read it back with `Payloads.fromXml`.
 
 After each new sign-in the SDK also catches up from the archive: messages sent and received on other devices while this one was offline appear, and ones read elsewhere are marked read.
+
+## Custom data in messages
+
+A message can carry your own data beside its text: a picture's link and size, a location, the id of the message it replies to. Each kind of data is its own element in the message, with a name and a namespace you choose, so it never clashes with anyone else's and apps that don't know it ignore it.
+
+Describe the data once as a `PayloadType`. `payloadType` turns key/value fields into child elements, so there is no XML to write:
+
+```kotlin
+data class Picture(val url: String, val size: Long, val width: Int?, val height: Int?, val mime: String?)
+
+val PictureType = payloadType<Picture>(
+    name = "picture",
+    namespace = "urn:example:picture:0",   // a URI you own; bump the version if the format changes
+    write = {
+        put("url", it.url)
+        put("size", it.size)
+        put("width", it.width)               // null values are left out
+        put("height", it.height)
+        put("mime", it.mime)
+    },
+    read = {
+        Picture(
+            url = string("url") ?: return@payloadType null,   // null = not usable, skipped
+            size = long("size") ?: 0,
+            width = int("width"),
+            height = int("height"),
+            mime = string("mime"),
+        )
+    },
+)
+```
+
+Send it with the caption as the text, and read it on the other side:
+
+```kotlin
+chat.send(bob, "Sunset at the beach", PictureType.write(picture))
+
+// In the message list:
+val picture = message.payload(PictureType)
+if (picture != null) PictureBubble(picture, caption = message.body) else TextBubble(message.body)
+```
+
+The message on the wire:
+
+```xml
+<message to="bob@example.com" type="chat" id="…">
+  <body>Sunset at the beach</body>
+  <picture xmlns="urn:example:picture:0">
+    <url>https://files.example.com/sunset.jpg</url>
+    <size>48213</size>
+    <width>1024</width>
+    <height>768</height>
+    <mime>image/jpeg</mime>
+  </picture>
+  …
+</message>
+```
+
+- **Fields.** `put(key, value)` takes strings, numbers and booleans; read them back with `string`, `int`, `long`, `double` and `boolean`. `putAll(key, values)` and `strings(key)` give a list, and `put(key) { … }` with `child(key)` a group of fields. Keys are XML names: letters, digits, `-`, `_` and `.`.
+- **Several kinds of data in one message.** Pass several: `chat.send(bob, "Here", PictureType.write(p), LocationType.write(l))`. `message.payloads(PictureType)` returns all of one type.
+- **Anything else.** `message.payloads` is the list of raw elements, including other apps' data (such as `jabber:x:oob` links from other XMPP clients). For a shape the fields can't express, implement `PayloadType` yourself and build the `Element` with the `element(...)` builder.
+- **The body is the fallback.** Other XMPP apps show only the text, so make it useful: a caption, or the link itself. It can be empty when the data says it all; the SDK then asks the server to keep the message anyway.
+- **Upload first, send the link.** Messages have a size limit on the server (often 64 KB), so put the file on your own storage or the server's HTTP upload service and send its address, never the bytes.
+- **What's checked.** Namespaces the SDK uses itself (receipts, markers, typing and so on) are refused with `IllegalArgumentException`, and they never show up in `payloads`. A malformed payload reads as null rather than throwing, so a bad message from someone else can't break a chat.
+- **Everywhere a message goes.** Payloads arrive live, as copies from your other devices, from offline storage and from the archive, and a `retry` keeps them. A `MessageStore` can keep them in one text column with `Payloads.toXml(message.payloads)` and `Payloads.fromXml(text)`.
+
+With the protocol-level API, the same works through `im.messaging.send(to, body, payloads = listOf(...))` and `ChatMessage.payload(type)`.
 
 ## Push notifications
 

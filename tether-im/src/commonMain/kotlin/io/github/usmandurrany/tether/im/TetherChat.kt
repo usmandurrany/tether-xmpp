@@ -11,6 +11,7 @@ import io.github.usmandurrany.tether.core.KeyValueStore
 import io.github.usmandurrany.tether.core.OutboxFullException
 import io.github.usmandurrany.tether.core.SessionContext
 import io.github.usmandurrany.tether.core.XmppClient
+import io.github.usmandurrany.tether.xml.Element
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
@@ -75,6 +76,12 @@ public data class Message(
     val markable: Boolean = false,
     /** Ours, but sent from another of our devices. */
     val fromOtherDevice: Boolean = false,
+    /**
+     * The app's own data sent with the message, such as a picture's link and
+     * size. Read it with `message.payload(PictureType)`; see [PayloadType].
+     * A [MessageStore] can keep these as one string with [Payloads.toXml].
+     */
+    val payloads: List<Element> = emptyList(),
 )
 
 /** One entry of the chat list. */
@@ -336,8 +343,18 @@ public class TetherChat(
     /**
      * Sends [text] to [to] and returns the message at once, as SENDING. Works
      * offline: it waits on the device and goes out on the next connection.
+     *
+     * [payloads] carry the app's own data in the same message, such as
+     * `PictureType.write(picture)` with the caption as [text]; see
+     * [PayloadType]. [text] may be empty when the data says it all, but it is
+     * what other XMPP apps show, so a caption or a link is a better fallback.
+     *
+     * Throws [IllegalArgumentException] when a payload uses a namespace the
+     * SDK reserves.
      */
-    public fun send(to: BareJid, text: String): Message {
+    public fun send(to: BareJid, text: String, vararg payloads: Element): Message {
+        val extra = payloads.toList()
+        Payloads.requireSendable(extra)
         val message = Message(
             id = newId(),
             peer = to,
@@ -346,12 +363,13 @@ public class TetherChat(
             timestamp = now(),
             status = MessageStatus.SENDING,
             markable = features.readMarkers,
+            payloads = extra,
         )
         merge(listOf(message)) { old, _ -> old }
         work.trySend {
             stopComposing(to)
             try {
-                im.messaging.send(to, text, id = message.id)
+                im.messaging.send(to, text, id = message.id, payloads = extra)
                 // Without stream management the server never confirms, so on its way is the best we know.
                 val session = client.session.value
                 if (session != null && session.streamManagement == null) setStatus(message.id, MessageStatus.SENT)
@@ -363,13 +381,13 @@ public class TetherChat(
     }
 
     /**
-     * Sends a failed message again, as a new message with the same text. The
-     * failed one is removed.
+     * Sends a failed message again, as a new message with the same text and
+     * payloads. The failed one is removed.
      */
     public fun retry(message: Message): Message? {
         if (!message.outgoing || message.status != MessageStatus.FAILED) return null
         remove(message)
-        return send(message.peer, message.body)
+        return send(message.peer, message.body, *message.payloads.toTypedArray())
     }
 
     /**
@@ -652,6 +670,7 @@ public class TetherChat(
             thread = thread,
             markable = markable,
             fromOtherDevice = outgoing && carbon,
+            payloads = payloads,
         )
     }
 
@@ -716,6 +735,7 @@ public class TetherChat(
             serverId = serverId ?: other.serverId,
             markable = markable || other.markable,
             thread = thread ?: other.thread,
+            payloads = payloads.ifEmpty { other.payloads },
         )
     }
 }

@@ -53,7 +53,10 @@ public data class ChatMessage(
     val stanza: Element,
     /** The sender asked for read markers (XEP-0333): answer with [Messaging.markDisplayed] once it is shown. */
     val markable: Boolean = false,
-)
+) {
+    /** The app's own elements in the message, such as a picture's details; read them with a [PayloadType]. */
+    val payloads: List<Element> get() = Payloads.of(stanza)
+}
 
 /** What happens to messages. */
 public sealed interface MessageEvent {
@@ -129,6 +132,10 @@ public class Messaging(
     /**
      * Sends a chat message and returns its id. Returns once it is on its way;
      * [MessageEvent.SentToServer] and [MessageEvent.Delivered] follow.
+     *
+     * [payloads] go in the same stanza, after the body. [body] is what clients
+     * that do not know them show, so make it a useful fallback: a caption, or
+     * the link itself.
      */
     public suspend fun send(
         to: BareJid,
@@ -137,7 +144,10 @@ public class Messaging(
         thread: String? = null,
         requestReceipt: Boolean = requestReceipts,
         markable: Boolean = this.markable,
+        /** The app's own elements, sent beside the body; see [PayloadType]. */
+        payloads: List<Element> = emptyList(),
     ): String {
+        Payloads.requireSendable(payloads)
         client.send(
             element("message", ImNs.CLIENT) {
                 attribute("to", to.toString())
@@ -149,6 +159,9 @@ public class Messaging(
                 if (requestReceipt) element("request", ImNs.RECEIPTS)
                 if (markable) element("markable", ImNs.MARKERS)
                 if (chatStates) element("active", ImNs.CHAT_STATES)
+                payloads.forEach(::child)
+                // Servers may skip archiving a message with an empty body; data alone is still worth keeping.
+                if (body.isEmpty() && payloads.isNotEmpty()) element("store", ImNs.HINTS)
             },
         )
         return id

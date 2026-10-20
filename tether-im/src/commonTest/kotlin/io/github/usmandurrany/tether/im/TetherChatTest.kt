@@ -273,4 +273,36 @@ class TetherChatTest {
         runCurrent()
         assertEquals(MessageStatus.READ, h.chat.messages(romeo).value.single().status)
     }
+
+    private val linkType = payloadType<String>("link", "urn:example:link:0", { put("url", it) }, { string("url") })
+
+    @Test
+    fun payloadsGoOutWithTheMessageAndComeBackOnTheOtherSide() = runTest {
+        val h = harness()
+        val m = h.chat.send(romeo, "Look", linkType.write("https://example.org/a"))
+        assertEquals("https://example.org/a", m.payload(linkType))
+        runCurrent()
+        assertEquals("https://example.org/a", h.sent().single().child("link", "urn:example:link:0")?.child("url")?.text)
+
+        h.incoming(
+            "<message from='romeo@example.net/o' type='chat' id='r1'><body>Back</body>" +
+                "<link xmlns='urn:example:link:0'><url>https://example.org/b</url></link></message>",
+        )
+        runCurrent()
+        val theirs = h.chat.allMessages.value[romeo].orEmpty().single { !it.outgoing }
+        assertEquals("https://example.org/b", theirs.payload(linkType))
+    }
+
+    @Test
+    fun aRetriedMessageKeepsItsPayloads() = runTest {
+        val h = harness()
+        val m = h.chat.send(romeo, "Look", linkType.write("https://example.org/a"))
+        runCurrent()
+        h.incoming("<message from='romeo@example.net' type='error' id='${m.id}'><error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>")
+        runCurrent()
+        val failed = h.chat.allMessages.value[romeo].orEmpty().single()
+        assertEquals(MessageStatus.FAILED, failed.status)
+        val again = assertNotNull(h.chat.retry(failed))
+        assertEquals("https://example.org/a", again.payload(linkType))
+    }
 }
