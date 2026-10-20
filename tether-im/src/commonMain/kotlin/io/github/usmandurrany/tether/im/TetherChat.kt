@@ -14,9 +14,11 @@ import io.github.usmandurrany.tether.core.XmppClient
 import io.github.usmandurrany.tether.xml.Element
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.FlowCollector
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -230,8 +232,8 @@ public class TetherChat(
 
     /** Every message, per contact, oldest first. */
     public val allMessages: StateFlow<Map<BareJid, List<Message>>> =
-        threads.map { all -> all.mapValues { (_, list) -> list.filterNot { it.hidden } } }
-            .stateIn(scope, SharingStarted.Eagerly, emptyMap())
+        // Derived without a coroutine, so `.value` is up to date the moment a call such as deleteForMe returns.
+        MappedStateFlow(threads) { all -> all.mapValues { (_, list) -> list.filterNot { it.hidden } } }
 
     /** When each offline contact was last online, as far as we know. */
     private val lastSeenTimes: StateFlow<Map<BareJid, Long>> =
@@ -898,5 +900,35 @@ public class TetherChat(
             hidden = true,
             status = if (!outgoing && status == MessageStatus.UNREAD) MessageStatus.READ else status,
         )
+    }
+}
+
+/**
+ * [source] passed through [transform] on read, with no coroutine in between:
+ * the value never lags behind the source. The last result is cached per
+ * source value, so reading it again is free.
+ */
+@OptIn(ExperimentalForInheritanceCoroutinesApi::class)
+private class MappedStateFlow<T, R>(
+    private val source: StateFlow<T>,
+    private val transform: (T) -> R,
+) : StateFlow<R> {
+    private class Cached<T, R>(val from: T, val result: R)
+
+    @Volatile
+    private var cache: Cached<T, R>? = null
+
+    override val value: R
+        get() {
+            val current = source.value
+            cache?.let { if (it.from === current) return it.result }
+            return transform(current).also { cache = Cached(current, it) }
+        }
+
+    override val replayCache: List<R> get() = listOf(value)
+
+    override suspend fun collect(collector: FlowCollector<R>): Nothing {
+        source.map { value }.distinctUntilChanged().collect(collector)
+        error("a StateFlow never completes")
     }
 }

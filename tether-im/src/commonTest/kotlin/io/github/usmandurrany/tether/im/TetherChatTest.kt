@@ -386,8 +386,9 @@ class TetherChatTest {
         h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>one</body></message>")
         runCurrent()
         h.chat.deleteForMe(h.chat.allMessages.value[romeo].orEmpty().single())
-        runCurrent()
+        // Gone at once, with no dispatch in between.
         assertTrue(h.chat.allMessages.value[romeo].orEmpty().isEmpty())
+        runCurrent()
         assertEquals(0, h.chat.unreadCount.value)
         h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>one</body></message>")
         runCurrent()
