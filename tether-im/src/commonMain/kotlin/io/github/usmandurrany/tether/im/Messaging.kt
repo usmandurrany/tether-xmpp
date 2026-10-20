@@ -51,6 +51,8 @@ public data class ChatMessage(
     val carbon: Boolean,
     val chatState: ChatState?,
     val stanza: Element,
+    /** The sender asked for read markers (XEP-0333): answer with [Messaging.markDisplayed] once it is shown. */
+    val markable: Boolean = false,
 )
 
 /** What happens to messages. */
@@ -61,8 +63,20 @@ public sealed interface MessageEvent {
     /** The server confirmed it got our message (XEP-0198): one tick. */
     public data class SentToServer(val id: String) : MessageEvent
 
-    /** The recipient's device confirmed delivery (XEP-0184): two ticks. */
+    /** The recipient's device confirmed delivery (XEP-0184, or a XEP-0333 `received` marker): two ticks. */
     public data class Delivered(val peer: BareJid, val id: String) : MessageEvent
+
+    /**
+     * The contact has read our message [id] and every earlier one in the chat
+     * (XEP-0333 `displayed`): blue ticks.
+     */
+    public data class Displayed(val peer: BareJid, val id: String) : MessageEvent
+
+    /**
+     * We read the contact's message [id], and every earlier one, on another of
+     * our devices (a carbon of our own XEP-0333 marker): clear the unread count.
+     */
+    public data class DisplayedElsewhere(val peer: BareJid, val id: String) : MessageEvent
 
     /** The server bounced our message, for example because the address does not exist. */
     public data class Failed(val id: String, val peer: BareJid?, val condition: String?) : MessageEvent
@@ -83,6 +97,10 @@ public sealed interface MessageEvent {
  * - A carbon (XEP-0280) is only trusted when it comes from our own account:
  *   anyone else sending a "carbon" could otherwise inject messages that appear
  *   to come from us or from a contact.
+ * - Sent messages are `markable` (XEP-0333), so the contact's client can say
+ *   when they were read; those markers arrive as [MessageEvent.Displayed].
+ *   Markers are only sent when the app calls [markDisplayed]: only the app
+ *   knows when a message is on screen.
  *
  * Collect [events] before connecting: events with no collector are dropped.
  * Install [Carbons] too, to see messages sent and received on other devices.
@@ -91,6 +109,12 @@ public class Messaging(
     private val client: StanzaSender,
     /** Answer receipt requests automatically. */
     private val sendReceipts: Boolean = true,
+    /** Default for [send]: ask the recipient's device to confirm delivery (XEP-0184). */
+    private val requestReceipts: Boolean = true,
+    /** Default for [send]: let the recipient say when they read it (XEP-0333). */
+    private val markable: Boolean = true,
+    /** Add `<active/>` (XEP-0085) to sent messages. */
+    private val chatStates: Boolean = true,
 ) : ClientExtension {
     @Volatile
     private var own: BareJid? = null
@@ -111,7 +135,8 @@ public class Messaging(
         body: String,
         id: String = newId(),
         thread: String? = null,
-        requestReceipt: Boolean = true,
+        requestReceipt: Boolean = requestReceipts,
+        markable: Boolean = this.markable,
     ): String {
         client.send(
             element("message", ImNs.CLIENT) {
@@ -122,10 +147,29 @@ public class Messaging(
                 thread?.let { element("thread") { text(it) } }
                 element("origin-id", ImNs.SID) { attribute("id", id) }
                 if (requestReceipt) element("request", ImNs.RECEIPTS)
-                element("active", ImNs.CHAT_STATES)
+                if (markable) element("markable", ImNs.MARKERS)
+                if (chatStates) element("active", ImNs.CHAT_STATES)
             },
         )
         return id
+    }
+
+    /**
+     * Tells [to] that we have read their message [id] and everything before it
+     * (XEP-0333 `displayed`). Only for messages that were [ChatMessage.markable];
+     * other clients ignore markers for the rest. Kept by the server for a
+     * contact who is offline, and copied to our other devices as a carbon.
+     */
+    public suspend fun markDisplayed(to: BareJid, id: String, thread: String? = null) {
+        client.send(
+            element("message", ImNs.CLIENT) {
+                attribute("to", to.toString())
+                attribute("type", "chat")
+                element("displayed", ImNs.MARKERS) { attribute("id", id) }
+                thread?.let { element("thread") { text(it) } }
+                element("store", ImNs.HINTS)
+            },
+        )
     }
 
     /** Tells [to] that we are typing, paused, and so on. Never stored or archived. */
@@ -178,6 +222,19 @@ public class Messaging(
             return true
         }
         val state = ChatState.of(message)
+        if (type != "groupchat") {
+            markerOf(message)?.let { (marker, markedId) ->
+                when {
+                    // Our other device read their message: we have read it too.
+                    outgoing -> if (marker != "received") _events.emit(MessageEvent.DisplayedElsewhere(peer, markedId))
+                    marker == "received" -> _events.emit(MessageEvent.Delivered(peer, markedId))
+                    else -> _events.emit(MessageEvent.Displayed(peer, markedId))
+                }
+                // A marker can share its stanza with a typing state.
+                if (state != null && !outgoing) _events.emit(MessageEvent.ChatStateChanged(peer, state))
+                return true
+            }
+        }
         if (message.child("body", ImNs.CLIENT) == null) {
             if (state != null && !outgoing) {
                 _events.emit(MessageEvent.ChatStateChanged(peer, state))
@@ -203,6 +260,15 @@ public class Messaging(
 
     internal companion object {
         fun delayOf(message: Element): String? = message.child("delay", ImNs.DELAY)?.attribute("stamp")
+
+        /** The XEP-0333 marker ("received", "displayed" or "acknowledged") and the id it marks. */
+        fun markerOf(message: Element): Pair<String, String>? {
+            val marker = message.elements.firstOrNull { it.namespace == ImNs.MARKERS && it.name in MARKERS } ?: return null
+            val id = marker.attribute("id") ?: return null
+            return marker.name to id
+        }
+
+        private val MARKERS = setOf("received", "displayed", "acknowledged")
     }
 }
 
@@ -230,6 +296,7 @@ internal fun chatMessageOf(
         carbon = carbon,
         chatState = ChatState.of(message),
         stanza = message,
+        markable = message.child("markable", ImNs.MARKERS) != null,
     )
 }
 

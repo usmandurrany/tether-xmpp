@@ -281,5 +281,6 @@ Review process: code arrives as small pull requests, one logical piece each (for
 - Development server MongooseIM 6.8.0; minimum Android API 26 (v2).
 - Push generic over MongooseIM, Openfire, ejabberd and Prosody through pluggable node provisioning (v2).
 - E2EE deferred, with extension points fixed now (v2).
+- A high-level `TetherChat` API is the documented path: features are switched with `ChatFeatures` flags, and the SDK owns message state, read markers (XEP-0333), typing, history catch-up, lifecycle and threading. The protocol-level extensions stay public for advanced use (2026-10-19).
 
 Sources for push behaviour: [MongooseIM push guide](https://mongooseim-global-distrib.readthedocs.io/en/latest/user-guide/Push-notifications/), [Openfire Push Server plugin](https://igniterealtime.org/projects/openfire/plugins/1.1.0/pushserver/readme.html), [XEP-0357](https://www.xmpp.org/extensions/xep-0357.html).

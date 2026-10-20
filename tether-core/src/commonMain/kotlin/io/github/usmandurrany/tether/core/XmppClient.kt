@@ -127,7 +127,16 @@ public class XmppClient(
     private val extensions = ArrayList<ClientExtension>()
     private val sending = Mutex()
     private val outbox = ArrayDeque<Element>()
-    private val foreground = MutableStateFlow(true)
+    private val _foreground = MutableStateFlow(true)
+
+    /**
+     * Lives as long as the client: cancelled by [close]. Features built on the
+     * client run their background work here, so closing the client stops them too.
+     */
+    public val coroutineScope: CoroutineScope get() = scope
+
+    /** Whether the app is in the foreground, as last reported through [setForeground]. */
+    public val foreground: StateFlow<Boolean> = _foreground.asStateFlow()
 
     private val _session = MutableStateFlow<XmppSession?>(null)
     private val _stanzas = MutableSharedFlow<Element>(extraBufferCapacity = policy.stanzaBuffer)
@@ -160,7 +169,7 @@ public class XmppClient(
     init {
         // One reporter, so active and inactive reach the server in the order they happened.
         scope.launch {
-            foreground.collect { fg -> _session.value?.let { reportActivity(it, fg) } }
+            _foreground.collect { fg -> _session.value?.let { reportActivity(it, fg) } }
         }
         if (store != null) {
             scope.launch {
@@ -248,7 +257,7 @@ public class XmppClient(
         supervisor.networkChanged(available, id, kind)
 
     override fun setForeground(foreground: Boolean) {
-        this.foreground.value = foreground
+        _foreground.value = foreground
         supervisor.setForeground(foreground)
         // The OS may kill a background app at any moment: save now, not later.
         if (!foreground && store != null) scope.launch { runCatching { save() } }

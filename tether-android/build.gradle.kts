@@ -32,6 +32,7 @@ kotlin {
 
 dependencies {
     api(project(":tether-core"))
+    api(project(":tether-im"))
     implementation(libs.conscrypt.android)
     implementation(libs.androidx.lifecycle.process)
     implementation(libs.kotlinx.coroutines.android)

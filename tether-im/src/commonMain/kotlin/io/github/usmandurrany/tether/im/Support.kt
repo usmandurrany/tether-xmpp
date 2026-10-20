@@ -14,6 +14,7 @@ internal object ImNs {
     const val DELAY = "urn:xmpp:delay"
     const val RECEIPTS = "urn:xmpp:receipts"
     const val CHAT_STATES = "http://jabber.org/protocol/chatstates"
+    const val MARKERS = "urn:xmpp:chat-markers:0"
     const val SID = "urn:xmpp:sid:0"
     const val HINTS = "urn:xmpp:hints"
     const val MAM = "urn:xmpp:mam:2"

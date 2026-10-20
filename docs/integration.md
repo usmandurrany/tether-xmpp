@@ -1,14 +1,14 @@
 # Integrating Tether
 
-This guide shows how to add Tether to an Android or JVM app: connect an account, keep it connected, and send and receive messages.
+This guide shows how to add Tether to an Android or JVM app. Most apps only need `TetherChat`: you pick features with on/off flags, and the SDK handles message state, read receipts, typing, history, reconnection, the app lifecycle and threading. The lower-level API stays available for apps that want to work with the protocol directly (see [Going deeper](#going-deeper)).
 
 ## Modules
 
 | Module | What it gives you |
 | --- | --- |
 | `tether-core` | `XmppClient`: login, reconnection, stream resumption, outbox, saved state |
-| `tether-im` | Roster, presence, messages (receipts, typing, carbons), history (MAM), push registration |
-| `tether-android` | Android wiring: DNS, TLS (Conscrypt), app lifecycle, network changes, encrypted storage |
+| `tether-im` | `TetherChat`, plus the protocol-level features: roster, presence, messages (receipts, read markers, typing, carbons), history (MAM), push |
+| `tether-android` | Android wiring: DNS, TLS (Conscrypt), app lifecycle, network changes, encrypted storage. Brings `tether-im` with it. |
 
 `tether-xml`, `tether-sasl`, `tether-crypto` and `tether-transport` come in as dependencies of `tether-core`.
 
@@ -27,13 +27,160 @@ repositories { mavenLocal() }
 
 dependencies {
     implementation("io.github.usmandurrany.tether:tether-android:0.1.0-SNAPSHOT") // Android apps
-    implementation("io.github.usmandurrany.tether:tether-im:0.1.0-SNAPSHOT")
+    // implementation("io.github.usmandurrany.tether:tether-im:0.1.0-SNAPSHOT")    // desktop and server JVMs
 }
 ```
 
-On a desktop or server JVM, use `tether-core` instead of `tether-android`. Add `org.conscrypt:conscrypt-openjdk-uber:2.7.0` as well if you want the stronger `tls-exporter` channel binding on TLS 1.3; without it the JDK's TLS is used with `tls-server-end-point`.
+On a desktop or server JVM, use `tether-im` instead of `tether-android`. Add `org.conscrypt:conscrypt-openjdk-uber:2.7.0` as well if you want the stronger `tls-exporter` channel binding on TLS 1.3; without it the JDK's TLS is used with `tls-server-end-point`.
 
-## Android
+## Quick start
+
+### 1. Create the chat, once per account
+
+Android, in your `Application` or a DI singleton:
+
+```kotlin
+val chat = TetherAndroid.chat(
+    context,
+    BareJid.parse("alice@example.com"),
+    password = typedPassword,          // first sign-in only; later runs use the saved login
+    features = ChatFeatures(),         // everything on; see "Features" below
+)
+chat.connect()
+```
+
+Desktop or server JVM:
+
+```kotlin
+import io.github.usmandurrany.tether.im.chat
+
+val chat = TetherJvm.chat(BareJid.parse("alice@example.com"), password = typedPassword)
+chat.connect()
+```
+
+That is all the setup. `chat(...)` is a suspend function (it reads the saved login), so call it from a coroutine. Without a password it signs in with the keys the last sign-in saved, and throws `IllegalArgumentException` when there are none: check first with `CredentialVault(TetherAndroid.secureStore(context)).hasKeys(jid)` to decide whether to show a password field.
+
+The chat runs on its own background threads. Every function can be called from the UI thread, and every list is a `StateFlow`, so there is no "collect before connecting" rule: collect whenever the screen needs it. On Android it also follows the app lifecycle and the network (closing the connection in the background so the server sends pushes, reconnecting when the app comes back) and keeps its state in Keystore-encrypted storage. The password itself is never stored.
+
+Use one `TetherChat` per account for the life of the process. Two for the same account would keep kicking each other off the server.
+
+### 2. Show the chat list and a chat
+
+```kotlin
+chat.conversations.collect { list -> render(list) }   // most recent first
+chat.messages(bob).collect { messages -> render(messages) }  // oldest first
+chat.unreadCount.collect { badge(it) }
+chat.connection.collect { state -> header(state) }    // Online, Connecting, WaitingForNetwork...
+```
+
+Each `Conversation` has the contact's `name`, `lastMessage`, `unreadCount`, `typing` and `online`. Each `Message` has a stable `id` (use it as the list key), `body`, `outgoing`, `timestamp` (epoch milliseconds, the server's time when it kept the message) and `status`:
+
+| Status | Shown as | Meaning |
+| --- | --- | --- |
+| `SENDING` | no tick | Ours, waiting on this device (also while offline) |
+| `SENT` | one tick | The server has it |
+| `DELIVERED` | two ticks | The contact's device has it |
+| `READ` | blue ticks | Ours: the contact read it. Theirs: we read it, here or on another device |
+| `FAILED` | error | The server refused it; `error` says why. `chat.retry(message)` sends it again |
+| `UNREAD` | bold | Theirs, not read yet |
+
+The status only moves forward, whatever order the network reports things in, and the same message never shows twice (live, a copy from another of your devices, and the archive are merged).
+
+### 3. Send, type, and tell the SDK what is on screen
+
+```kotlin
+chat.send(bob, "Hi Bob")      // returns the Message at once, as SENDING; works offline
+chat.typing(bob)              // on every change of the text field
+chat.openChat(bob)            // the chat is on screen
+chat.closeChat(bob)           // it left the screen
+```
+
+`openChat` is how read receipts work: while a chat is open and the app is in the foreground, its messages are marked read and the contact is told (only for messages that asked for it, as XEP-0333 requires). The first time a chat opens, its newest page of history loads. Call `chat.loadOlder(bob)` when the user scrolls to the top; it returns false when there is nothing older.
+
+`typing` sends "typing" once, then "paused" after five idle seconds; sending the message ends it. A contact who stops typing without saying so stops showing as typing after 30 seconds.
+
+### 4. Contacts and presence
+
+```kotlin
+chat.contacts.collect { render(it) }               // name, online, show (away, busy), status
+chat.contactRequests.collect { askUser(it) }       // people asking to see our presence
+
+chat.addContact(bob, name = "Bob")   // adds and asks to see Bob's presence
+chat.approve(carol)                  // lets Carol see ours, and asks for hers
+chat.deny(mallory)
+chat.removeContact(bob)
+chat.setPresence(Show.AWAY, "In a meeting")
+```
+
+These need a connection and throw `XmppStanzaException` if the server refuses.
+
+### 5. Sign out
+
+```kotlin
+chat.signOut()   // stops push, disconnects, forgets the saved login, contacts and messages
+chat.close()     // or: just stop, keeping the login for next time
+```
+
+## Features
+
+Every feature is on by default. Switch off what your app does not want:
+
+```kotlin
+ChatFeatures(
+    deliveryReceipts = true,   // two ticks (XEP-0184)
+    readMarkers = true,        // blue ticks: see when contacts read ours (XEP-0333)
+    sendReadMarkers = true,    // tell contacts when we read theirs
+    typingIndicators = true,   // both ways (XEP-0085)
+    contacts = true,           // the contact list on the server (roster)
+    presence = true,           // contacts' online status and requests
+    multiDevice = true,        // messages from our other devices (carbons, XEP-0280)
+    history = true,            // the server archive (XEP-0313)
+)
+```
+
+`sendReadMarkers` is a privacy setting: with it off you still see other people's read markers. It can also change at run time with `chat.sendReadMarkers = false`. With `presence` off the account still goes online (the server only delivers messages to an online device); contacts' status just is not tracked.
+
+Each feature also checks that the server supports it, so a feature the server lacks turns itself off. See the [server checklist](#server-checklist).
+
+## Keeping messages
+
+By default messages live in memory. After a restart, recent chats are rebuilt from the server archive, and each chat's history loads when it opens. To keep messages on the device, implement `MessageStore` (three functions: `load`, `save`, `clear`) on Room, SQLDelight or a file, and pass it:
+
+```kotlin
+val chat = TetherAndroid.chat(context, jid, password, messageStore = RoomMessageStore(db))
+```
+
+`save` receives every new or changed message; replace by `peer`, `outgoing` and `id`.
+
+After each new sign-in the SDK also catches up from the archive: messages sent and received on other devices while this one was offline appear, and ones read elsewhere are marked read.
+
+## Push notifications
+
+Get a token from FCM (or APNs), then register it with the server's push service. The fields differ by server:
+
+```kotlin
+// MongooseIM (mod_event_pusher_push)
+chat.registerPush(PushTarget(
+    service = "pubsub.example.com",
+    node = deviceId,                                  // any stable id per device
+    publishOptions = mapOf("device_id" to fcmToken, "service" to "fcm"),
+    createNode = true,
+))
+```
+
+For ejabberd and Openfire, `service` is the push app server's JID and `node` and `publishOptions` are what it gave this device (see the `PushTarget` docs). Watch `chat.im.push.state`: `Unsupported` means the server has no XEP-0357 support. Tether re-registers on every new login.
+
+When a push arrives, call `chat.client.wake()`: it checks a live connection at once, or skips the wait before the next retry.
+
+## Desktop notes
+
+`TetherJvm.chat` keeps its state in `~/.tether/<account>.properties`, readable by your user only (pass `store = FileKeyValueStore(path)` to choose the place). Tell the chat about window focus with `chat.client.setForeground(focused)`, so read markers only go out while the user can see the chat, and about network changes with `chat.client.networkChanged(available)` if you can detect them. Without these, the app counts as always in the foreground and always online.
+
+## Going deeper
+
+`chat.im` gives the protocol-level features `TetherChat` is built on, and `chat.client` the connection itself. You can also build them yourself, as below, and handle the events directly. Install everything before `connect()`.
+
+### Android
 
 Create one client per account for the life of the process, in an application-wide scope (for example in your `Application` class or a DI singleton):
 
@@ -68,7 +215,7 @@ The password is never stored. After the first successful login, Tether saves the
 
 Permissions (`INTERNET`, `ACCESS_NETWORK_STATE`) come from the library manifest.
 
-## JVM (desktop, server, tools)
+### JVM (desktop, server, tools)
 
 ```kotlin
 val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -80,7 +227,7 @@ client.connect()
 
 Desktop apps should call `client.setForeground(...)` and `client.networkChanged(...)` themselves if they know about window focus or network changes. Without them the client behaves as a foreground app on an always-available network.
 
-## Connection state
+### Connection state
 
 ```kotlin
 scope.launch {
@@ -99,7 +246,7 @@ scope.launch {
 
 `connect()` returns once the first attempt finishes, with `ConnectResult.Connected`, `Failed` or `Cancelled`. After that, Tether keeps reconnecting on its own until `disconnect()`. Only a `Terminal` state needs the user (or a new `connect()`).
 
-## Messages
+### Messages
 
 ```kotlin
 scope.launch {
@@ -108,6 +255,8 @@ scope.launch {
             is MessageEvent.Received -> save(event.message)       // live, carbons and offline messages
             is MessageEvent.SentToServer -> markSent(event.id)    // the server confirmed it (XEP-0198)
             is MessageEvent.Delivered -> markDelivered(event.id)  // the contact's device confirmed it (XEP-0184)
+            is MessageEvent.Displayed -> markReadUpTo(event.peer, event.id)          // the contact read it and all before (XEP-0333)
+            is MessageEvent.DisplayedElsewhere -> markTheirsReadUpTo(event.peer, event.id) // we read theirs on another device
             is MessageEvent.Failed -> markFailed(event.id, event.condition)
             is MessageEvent.ChatStateChanged -> showTyping(event.peer, event.state)
         }
@@ -120,7 +269,9 @@ im.messaging.sendChatState(bob, ChatState.COMPOSING)
 
 `send` works while offline: the message waits in the outbox (kept across restarts) and goes out on the next connection. Save the returned id with the message so you can match the later events. `ChatMessage.serverId` is the archive id; use it to de-duplicate messages that arrive both live and from history.
 
-## Contacts and presence
+Sent messages are markable (XEP-0333). When a message with `ChatMessage.markable` is on screen, call `im.messaging.markDisplayed(peer, id)` for the newest one; never for messages that are not markable. A marker for an id covers that message and every earlier one. Archive pages carry archived receipts and markers in `HistoryPage.markers`. `InstantMessaging(client, features = ChatFeatures(...))` takes the same feature flags as `TetherChat`.
+
+### Contacts and presence
 
 ```kotlin
 im.roster.items.collect { contacts -> render(contacts.values) }
@@ -133,7 +284,7 @@ im.presences.approve(bob)      // let Bob see ours
 im.presences.set(OwnPresence(show = Show.AWAY, status = "In a meeting"))
 ```
 
-## History
+### History
 
 ```kotlin
 if (im.history.available.value) {
@@ -144,23 +295,9 @@ if (im.history.available.value) {
 
 History needs `mod_mam` (MongooseIM, ejabberd) or the Openfire Monitoring plugin on the server. `available` is false otherwise.
 
-## Push notifications
+### Push notifications
 
-Get a token from FCM (or APNs), then register it with the server's push service. The fields differ by server:
-
-```kotlin
-// MongooseIM (mod_event_pusher_push)
-im.push.register(PushTarget(
-    service = "pubsub.example.com",
-    node = deviceId,                                  // any stable id per device
-    publishOptions = mapOf("device_id" to fcmToken, "service" to "fcm"),
-    createNode = true,
-))
-```
-
-For ejabberd and Openfire, `service` is the push app server's JID and `node` and `publishOptions` are what it gave this device (see the `PushTarget` docs). Watch `im.push.state`: `Unsupported` means the server has no XEP-0357 support. Tether re-registers on every new login and checks the server's capabilities first.
-
-When a push arrives, call `client.wake()`: it checks a live connection at once, or skips the wait before the next retry.
+`im.push.register(...)` and `im.push.state`, as in [Push notifications](#push-notifications) above.
 
 ## Login options
 
