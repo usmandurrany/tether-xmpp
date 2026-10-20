@@ -8,38 +8,46 @@ import io.github.usmandurrany.tether.xml.XmlWriter
 import io.github.usmandurrany.tether.xml.element
 
 /**
- * Your own data in a message, beside its body: a picture's link and size, a
- * location, a reply-to id, anything. Each kind of data is one XML element with
- * a [name] and a [namespace] you choose, so other apps' data never clashes
- * with yours and clients that do not know it simply ignore it.
+ * Your own data in a message, beside its text: a photo's link and size, a
+ * location, a reply-to id, anything.
  *
- * Most apps make one with [payloadType], which turns key/value fields into
- * child elements, so there is no XML to write:
+ * The simple way needs no setup: give the data a type name and some fields.
  *
  * ```
- * data class Picture(val url: String, val size: Long, val width: Int?, val height: Int?)
+ * chat.send(bob, "Sunset at the beach", MessageData("photo", "url" to url, "size" to 48213, "width" to 1024))
  *
- * val PictureType = payloadType<Picture>(
- *     name = "picture",
- *     namespace = "urn:example:picture:0",
- *     write = { put("url", it.url); put("size", it.size); put("width", it.width); put("height", it.height) },
- *     read = { Picture(string("url") ?: return@payloadType null, long("size") ?: 0, int("width"), int("height")) },
+ * // On the other side:
+ * val photo = message.data("photo")          // null for a plain text message
+ * photo?.string("url"); photo?.long("size"); photo?.int("width")
+ * ```
+ *
+ * Each field becomes its own tag in the message, under one element named
+ * after the type: `<photo><url>…</url><size>48213</size><width>1024</width></photo>`.
+ * Apps that do not know it ignore it and show the text.
+ *
+ * For data with lists or nested groups, or to map straight to your own class,
+ * define a [PayloadType] with [payloadType]:
+ *
+ * ```
+ * val PhotoType = payloadType<Photo>(
+ *     name = "photo",
+ *     write = { put("url", it.url); put("size", it.size); putAll("tag", it.tags) },
+ *     read = { Photo(string("url") ?: return@payloadType null, long("size") ?: 0, strings("tag")) },
  * )
- *
- * chat.send(bob, "Sunset at the beach", PictureType.write(picture))   // the caption is the body
- * message.payload(PictureType)?.let { showPicture(it) }               // on the other side
+ * chat.send(bob, "Sunset", PhotoType.write(photo))
+ * message.payload(PhotoType)
  * ```
  *
- * On the wire that message carries
- * `<picture xmlns="urn:example:picture:0"><url>https://…</url><size>48213</size><width>1024</width><height>768</height></picture>`
- * next to its `<body>`. For a shape [payloadType] cannot express, implement
- * this interface and build the [Element] yourself.
+ * Both use the SDK's own namespace unless you pass one, so there is nothing
+ * else to configure. A namespace of your own only matters for sharing a
+ * format with other apps; for a shape fields cannot express, implement this
+ * interface and build the [Element] yourself.
  */
 public interface PayloadType<T : Any> {
-    /** The element's name, such as "picture". */
+    /** The element's name, such as "photo". */
     public val name: String
 
-    /** The element's namespace: a URI you own, such as "urn:example:picture:0". Bump the version when the format changes. */
+    /** The element's namespace: [MessageData.NAMESPACE], or a URI of your own to share a format with other apps. */
     public val namespace: String
 
     /** The element that carries [value]. Its name and namespace must be [name] and [namespace]. */
@@ -63,9 +71,10 @@ public interface PayloadType<T : Any> {
  */
 public fun <T : Any> payloadType(
     name: String,
-    namespace: String,
     write: PayloadWriter.(T) -> Unit,
     read: PayloadReader.() -> T?,
+    /** Leave it out to use the SDK's own; pass a URI you own to share the format with other apps. */
+    namespace: String = MessageData.NAMESPACE,
 ): PayloadType<T> = FieldPayloadType(name, namespace, write, read)
 
 private class FieldPayloadType<T : Any>(
@@ -82,6 +91,81 @@ private class FieldPayloadType<T : Any>(
 
     override fun read(element: Element): T? =
         if (!matches(element)) null else runCatching { PayloadReader(element).reader() }.getOrNull()
+}
+
+/**
+ * Simple custom data: a [type] name and text fields, with no setup. Send it
+ * with [TetherChat.send] and read it back with `message.data(type)`.
+ *
+ * ```
+ * MessageData("photo", "url" to url, "size" to 48213, "width" to 1024)
+ * ```
+ *
+ * Values may be strings, numbers or booleans (written as text); null values
+ * are left out. [type] and the keys are names: letters, digits, `-`, `_`
+ * and `.`, not starting with a digit. For lists or nested fields, use
+ * [payloadType].
+ */
+public class MessageData(
+    /** What kind of data this is, such as "photo" or "location"; read it back with `message.data(type)`. */
+    public val type: String,
+    /** The fields, in the order they were given. */
+    public val fields: Map<String, String>,
+) {
+    public constructor(type: String, vararg fields: Pair<String, Any?>) :
+        this(type, fields.filter { it.second != null }.associate { it.first to it.second.toString() })
+
+    init {
+        Payloads.requireName(type, "type")
+        fields.keys.forEach { Payloads.requireName(it, "key") }
+    }
+
+    public operator fun get(key: String): String? = fields[key]
+
+    public fun string(key: String): String? = fields[key]
+
+    public fun int(key: String): Int? = fields[key]?.trim()?.toIntOrNull()
+
+    public fun long(key: String): Long? = fields[key]?.trim()?.toLongOrNull()
+
+    public fun double(key: String): Double? = fields[key]?.trim()?.toDoubleOrNull()
+
+    /** `true` or `1` is true, `false` or `0` is false. */
+    public fun boolean(key: String): Boolean? = when (fields[key]?.trim()) {
+        "true", "1" -> true
+        "false", "0" -> false
+        else -> null
+    }
+
+    /** The element that carries it in a message. */
+    public fun toElement(): Element = element(type, NAMESPACE) { fields.forEach { (k, v) -> element(k) { text(v) } } }
+
+    override fun equals(other: Any?): Boolean = other is MessageData && other.type == type && other.fields == fields
+
+    override fun hashCode(): Int = type.hashCode() * 31 + fields.hashCode()
+
+    override fun toString(): String = "MessageData($type, $fields)"
+
+    public companion object {
+        /** The namespace the SDK puts custom data in when the app gives none. */
+        public const val NAMESPACE: String = "urn:tether:data:0"
+
+        /**
+         * The data an element carries, when it is in [NAMESPACE]: each child
+         * element is a field. Nested children are skipped; null for elements
+         * of other namespaces.
+         */
+        public fun from(element: Element): MessageData? {
+            if (element.namespace != NAMESPACE) return null
+            return runCatching {
+                MessageData(
+                    element.name,
+                    element.elements.filter { it.namespace == NAMESPACE && it.elements.isEmpty() }
+                        .associate { field -> field.name to buildString { field.children.forEach { if (it is Text) append(it.value) } } },
+                )
+            }.getOrNull()
+        }
+    }
 }
 
 /** Writes the fields of a payload. Keys must be XML names: letters, digits, `-`, `_` and `.`, not starting with a digit. */
@@ -235,6 +319,15 @@ public fun <T : Any> ChatMessage.payload(type: PayloadType<T>): T? = payloads.fi
 
 /** Every payload of [type] in the message, in order. */
 public fun <T : Any> ChatMessage.payloads(type: PayloadType<T>): List<T> = payloads.mapNotNull(type::readOrNull)
+
+/** The first [MessageData] of [type] in the message, such as `message.data("photo")`; null when there is none. */
+public fun Message.data(type: String): MessageData? = payloads.firstNotNullOfOrNull { e -> MessageData.from(e)?.takeIf { it.type == type } }
+
+/** Every [MessageData] in the message, of any type. */
+public fun Message.allData(): List<MessageData> = payloads.mapNotNull(MessageData::from)
+
+/** The first [MessageData] of [type] in the message; null when there is none. */
+public fun ChatMessage.data(type: String): MessageData? = payloads.firstNotNullOfOrNull { e -> MessageData.from(e)?.takeIf { it.type == type } }
 
 /** [PayloadType.read] for a matching element, with a malformed one (null or an exception) as null. */
 private fun <T : Any> PayloadType<T>.readOrNull(element: Element): T? =

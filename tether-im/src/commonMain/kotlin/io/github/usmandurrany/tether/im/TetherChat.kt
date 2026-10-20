@@ -78,7 +78,8 @@ public data class Message(
     val fromOtherDevice: Boolean = false,
     /**
      * The app's own data sent with the message, such as a picture's link and
-     * size. Read it with `message.payload(PictureType)`; see [PayloadType].
+     * size. Read it with `message.data("photo")`, or `message.payload(PhotoType)`
+     * for a [PayloadType].
      * A [MessageStore] can keep these as one string with [Payloads.toXml].
      */
     val payloads: List<Element> = emptyList(),
@@ -341,13 +342,23 @@ public class TetherChat(
             .stateIn(scope, SharingStarted.WhileSubscribed(), threads.value[peer].orEmpty())
 
     /**
+     * Sends [text] with the app's own [data], such as
+     * `MessageData("photo", "url" to url, "size" to 48213)`, with the caption as
+     * [text]. Read it on the other side with `message.data("photo")`.
+     *
+     * [text] may be empty when the data says it all, but it is what other XMPP
+     * apps show, so a caption or a link is a better fallback.
+     */
+    public fun send(to: BareJid, text: String, data: MessageData, vararg more: MessageData): Message =
+        send(to, text, data.toElement(), *more.map(MessageData::toElement).toTypedArray())
+
+    /**
      * Sends [text] to [to] and returns the message at once, as SENDING. Works
      * offline: it waits on the device and goes out on the next connection.
      *
-     * [payloads] carry the app's own data in the same message, such as
-     * `PictureType.write(picture)` with the caption as [text]; see
-     * [PayloadType]. [text] may be empty when the data says it all, but it is
-     * what other XMPP apps show, so a caption or a link is a better fallback.
+     * [payloads] carry the app's own data in the same message: the simplest is
+     * the [MessageData] overload; `PhotoType.write(photo)` from a [PayloadType]
+     * goes here.
      *
      * Throws [IllegalArgumentException] when a payload uses a namespace the
      * SDK reserves.

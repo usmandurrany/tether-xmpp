@@ -274,7 +274,7 @@ class TetherChatTest {
         assertEquals(MessageStatus.READ, h.chat.messages(romeo).value.single().status)
     }
 
-    private val linkType = payloadType<String>("link", "urn:example:link:0", { put("url", it) }, { string("url") })
+    private val linkType = payloadType<String>("link", { put("url", it) }, { string("url") }, namespace = "urn:example:link:0")
 
     @Test
     fun payloadsGoOutWithTheMessageAndComeBackOnTheOtherSide() = runTest {
@@ -304,5 +304,22 @@ class TetherChatTest {
         assertEquals(MessageStatus.FAILED, failed.status)
         val again = assertNotNull(h.chat.retry(failed))
         assertEquals("https://example.org/a", again.payload(linkType))
+    }
+
+    @Test
+    fun simpleDataGoesOutAndComesBack() = runTest {
+        val h = harness()
+        val m = h.chat.send(romeo, "Sunset", MessageData("photo", "url" to "https://img.example/1.jpg", "size" to 48213))
+        assertEquals(48213L, m.data("photo")?.long("size"))
+        runCurrent()
+        assertEquals("https://img.example/1.jpg", h.sent().single().child("photo", MessageData.NAMESPACE)?.child("url")?.text)
+
+        h.incoming(
+            "<message from='romeo@example.net/o' type='chat' id='r1'><body>Mine</body>" +
+                "<photo xmlns='urn:tether:data:0'><url>https://img.example/2.jpg</url><width>800</width></photo></message>",
+        )
+        runCurrent()
+        val theirs = h.chat.allMessages.value[romeo].orEmpty().single { !it.outgoing }
+        assertEquals(800, theirs.data("photo")?.int("width"))
     }
 }

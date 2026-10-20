@@ -156,70 +156,81 @@ After each new sign-in the SDK also catches up from the archive: messages sent a
 
 ## Custom data in messages
 
-A message can carry your own data beside its text: a picture's link and size, a location, the id of the message it replies to. Each kind of data is its own element in the message, with a name and a namespace you choose, so it never clashes with anyone else's and apps that don't know it ignore it.
-
-Describe the data once as a `PayloadType`. `payloadType` turns key/value fields into child elements, so there is no XML to write:
+A message can carry your own data beside its text: a photo's link and size, a location, the id of the message it replies to. There is nothing to set up. Give the data a type name and some fields:
 
 ```kotlin
-data class Picture(val url: String, val size: Long, val width: Int?, val height: Int?, val mime: String?)
-
-val PictureType = payloadType<Picture>(
-    name = "picture",
-    namespace = "urn:example:picture:0",   // a URI you own; bump the version if the format changes
-    write = {
-        put("url", it.url)
-        put("size", it.size)
-        put("width", it.width)               // null values are left out
-        put("height", it.height)
-        put("mime", it.mime)
-    },
-    read = {
-        Picture(
-            url = string("url") ?: return@payloadType null,   // null = not usable, skipped
-            size = long("size") ?: 0,
-            width = int("width"),
-            height = int("height"),
-            mime = string("mime"),
-        )
-    },
-)
+chat.send(bob, "Sunset at the beach", MessageData("photo", "url" to url, "size" to 48213, "width" to 1024))
 ```
 
-Send it with the caption as the text, and read it on the other side:
+Read it on the other side:
 
 ```kotlin
-chat.send(bob, "Sunset at the beach", PictureType.write(picture))
-
-// In the message list:
-val picture = message.payload(PictureType)
-if (picture != null) PictureBubble(picture, caption = message.body) else TextBubble(message.body)
+val photo = message.data("photo")   // null for a plain text message
+if (photo != null) {
+    PhotoBubble(url = photo.string("url"), size = photo.long("size"), width = photo.int("width"), caption = message.body)
+} else {
+    TextBubble(message.body)
+}
 ```
 
-The message on the wire:
+Each field becomes its own tag in the message, next to the text:
 
 ```xml
 <message to="bob@example.com" type="chat" id="…">
   <body>Sunset at the beach</body>
-  <picture xmlns="urn:example:picture:0">
+  <photo xmlns="urn:tether:data:0">
     <url>https://files.example.com/sunset.jpg</url>
     <size>48213</size>
     <width>1024</width>
-    <height>768</height>
-    <mime>image/jpeg</mime>
-  </picture>
+  </photo>
   …
 </message>
 ```
 
-- **Fields.** `put(key, value)` takes strings, numbers and booleans; read them back with `string`, `int`, `long`, `double` and `boolean`. `putAll(key, values)` and `strings(key)` give a list, and `put(key) { … }` with `child(key)` a group of fields. Keys are XML names: letters, digits, `-`, `_` and `.`.
-- **Several kinds of data in one message.** Pass several: `chat.send(bob, "Here", PictureType.write(p), LocationType.write(l))`. `message.payloads(PictureType)` returns all of one type.
-- **Anything else.** `message.payloads` is the list of raw elements, including other apps' data (such as `jabber:x:oob` links from other XMPP clients). For a shape the fields can't express, implement `PayloadType` yourself and build the `Element` with the `element(...)` builder.
-- **The body is the fallback.** Other XMPP apps show only the text, so make it useful: a caption, or the link itself. It can be empty when the data says it all; the SDK then asks the server to keep the message anyway.
-- **Upload first, send the link.** Messages have a size limit on the server (often 64 KB), so put the file on your own storage or the server's HTTP upload service and send its address, never the bytes.
-- **What's checked.** Namespaces the SDK uses itself (receipts, markers, typing and so on) are refused with `IllegalArgumentException`, and they never show up in `payloads`. A malformed payload reads as null rather than throwing, so a bad message from someone else can't break a chat.
-- **Everywhere a message goes.** Payloads arrive live, as copies from your other devices, from offline storage and from the archive, and a `retry` keeps them. A `MessageStore` can keep them in one text column with `Payloads.toXml(message.payloads)` and `Payloads.fromXml(text)`.
+- **Values** can be strings, numbers or booleans. Read them back with `string`, `int`, `long`, `double` and `boolean`, or `photo["url"]`. Null values are left out. Type names and keys use letters, digits, `-`, `_` and `.`.
+- **Several kinds in one message:** `chat.send(bob, "Here", MessageData("photo", …), MessageData("location", …))`. `message.allData()` lists them all.
+- **The text is the fallback.** Other XMPP apps show only the text, so make it useful: a caption, or the link itself. It can be empty when the data says it all; the SDK then asks the server to keep the message anyway.
+- **Upload first, send the link.** Servers limit message size, often to 64 KB, so put the file on your own storage or the server's HTTP upload service and send its address, never the bytes.
+- **It goes everywhere a message goes:** live, copies from your other devices, offline storage, the archive, and `retry`. A malformed field reads as null rather than throwing, so a bad message from someone else can't break a chat.
+- **Keeping messages on the device:** a `MessageStore` can keep the data in one text column with `Payloads.toXml(message.payloads)` and `Payloads.fromXml(text)`.
 
-With the protocol-level API, the same works through `im.messaging.send(to, body, payloads = listOf(...))` and `ChatMessage.payload(type)`.
+### Your own classes, lists and groups
+
+To map data straight to a class, or to send lists and nested groups, describe it once with `payloadType`:
+
+```kotlin
+data class Photo(val url: String, val size: Long, val tags: List<String>, val thumbnail: String?)
+
+val PhotoType = payloadType<Photo>(
+    name = "photo",
+    write = {
+        put("url", it.url)
+        put("size", it.size)
+        putAll("tag", it.tags)                              // a list: one tag per value
+        put("thumbnail") { put("url", it.thumbnail) }       // a group of fields
+    },
+    read = {
+        Photo(
+            url = string("url") ?: return@payloadType null,  // null = not usable, skipped
+            size = long("size") ?: 0,
+            tags = strings("tag"),
+            thumbnail = child("thumbnail")?.string("url"),
+        )
+    },
+)
+
+chat.send(bob, "Sunset", PhotoType.write(photo))
+val photo: Photo? = message.payload(PhotoType)
+```
+
+Data sent this way and as `MessageData` with the same type name share one format, so either side can read the flat fields with `message.data("photo")`.
+
+### Going further
+
+- **Sharing a format with other apps:** pass `namespace = "urn:yourcompany:photo:0"` to `payloadType`. Without it the SDK uses its own namespace, `urn:tether:data:0`, which only matters to apps reading the raw XML.
+- **Raw XML:** `message.payloads` holds every element in the message that the SDK doesn't handle itself, including other apps' data such as `jabber:x:oob` links. For a shape fields can't express, implement `PayloadType` and build the `Element` with the `element(...)` builder.
+- **What's refused:** namespaces the SDK uses itself (receipts, markers, typing and so on) throw `IllegalArgumentException`, and they never show up in `payloads`.
+- **Protocol level:** `im.messaging.send(to, body, payloads = listOf(MessageData(…).toElement()))`, and `ChatMessage.data(type)` or `ChatMessage.payload(type)` on received messages.
 
 ## Push notifications
 

@@ -98,10 +98,10 @@ class PayloadsTest {
 
     @Test
     fun reservedNamespacesAndBadNamesAreRefused() {
-        assertFailsWith<IllegalArgumentException> { payloadType<String>("receipt", ImNs.RECEIPTS, { put("a", it) }, { string("a") }) }
-        assertFailsWith<IllegalArgumentException> { payloadType<String>("body", ImNs.CLIENT, { put("a", it) }, { string("a") }) }
-        assertFailsWith<IllegalArgumentException> { payloadType<String>("1st", "urn:example:a", { put("a", it) }, { string("a") }) }
-        val bad = payloadType<String>("ok", "urn:example:a", { put("has space", it) }, { string("a") })
+        assertFailsWith<IllegalArgumentException> { payloadType<String>("receipt", { put("a", it) }, { string("a") }, namespace = ImNs.RECEIPTS) }
+        assertFailsWith<IllegalArgumentException> { payloadType<String>("body", { put("a", it) }, { string("a") }, namespace = ImNs.CLIENT) }
+        assertFailsWith<IllegalArgumentException> { payloadType<String>("1st", { put("a", it) }, { string("a") }) }
+        val bad = payloadType<String>("ok", { put("has space", it) }, { string("a") })
         assertFailsWith<IllegalArgumentException> { bad.write("v") }
     }
 
@@ -150,5 +150,39 @@ class PayloadsTest {
         assertEquals("a", m.payload(pictureType)?.url)
         assertEquals(listOf("a", "b"), m.payloads(pictureType).map { it.url })
         assertFalse(m.copy(payloads = emptyList()).has(pictureType))
+    }
+
+    @Test
+    fun simpleDataNeedsNoSetup() {
+        val data = MessageData("photo", "url" to "https://img.example/1.jpg", "size" to 48213, "width" to 1024, "alt" to null, "hd" to true)
+        assertEquals(
+            "<photo xmlns='urn:tether:data:0'><url>https://img.example/1.jpg</url><size>48213</size><width>1024</width><hd>true</hd></photo>",
+            XmlWriter.toXml(data.toElement()),
+        )
+        val back = assertNotNull(MessageData.from(xml(XmlWriter.toXml(data.toElement()))))
+        assertEquals(data, back)
+        assertEquals("https://img.example/1.jpg", back.string("url"))
+        assertEquals(48213L, back.long("size"))
+        assertEquals(1024, back.int("width"))
+        assertEquals(true, back.boolean("hd"))
+        assertNull(back["alt"])
+        assertNull(MessageData.from(xml("<photo xmlns='urn:example:photo:0'><url>u</url></photo>")))
+        assertFailsWith<IllegalArgumentException> { MessageData("my photo", "url" to "u") }
+        assertFailsWith<IllegalArgumentException> { MessageData("photo", "the url" to "u") }
+    }
+
+    @Test
+    fun simpleDataAndTypedPayloadsShareTheDefaultNamespace() {
+        val photoType = payloadType<String>("photo", { put("url", it) }, { string("url") })
+        assertEquals(MessageData.NAMESPACE, photoType.namespace)
+        val m = Message(
+            id = "1", peer = romeo, outgoing = false, body = "", timestamp = 0, status = MessageStatus.UNREAD,
+            payloads = listOf(MessageData("photo", "url" to "a").toElement(), MessageData("location", "lat" to 1.5).toElement()),
+        )
+        assertEquals("a", m.payload(photoType))
+        assertEquals("a", m.data("photo")?.string("url"))
+        assertEquals(1.5, m.data("location")?.double("lat"))
+        assertNull(m.data("video"))
+        assertEquals(listOf("photo", "location"), m.allData().map { it.type })
     }
 }
