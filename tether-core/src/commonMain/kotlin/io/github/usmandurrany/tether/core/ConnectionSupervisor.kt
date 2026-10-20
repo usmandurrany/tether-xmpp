@@ -5,6 +5,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -42,6 +43,16 @@ public interface LiveSession {
      */
     public suspend fun closeGracefully() {
         close()
+    }
+
+    /**
+     * Returns once the stream has been quiet for [quietMillis]: nothing came in
+     * and no request is waiting for an answer. Used to end a push wake as soon
+     * as the waiting messages are in. The default never returns, so the wake
+     * then lasts until its deadline.
+     */
+    public suspend fun awaitQuiet(quietMillis: Long) {
+        awaitCancellation()
     }
 }
 
@@ -127,6 +138,8 @@ public enum class BackgroundMode {
      * the drop at once and holds the session for its resume window; coming back
      * resumes without a login and replays what was missed. Whether the server
      * sends push notifications for a held session depends on the server.
+     * Some (Tigase, for one) hold messages for it without a push until the
+     * window ends, so with push notifications prefer [CLOSE].
      */
     DETACH,
 
@@ -161,18 +174,30 @@ public data class ReconnectPolicy(
      */
     val backgroundCloseDelayMillis: Long = 5_000,
     /**
-     * How long [ConnectionSupervisor.wakeForPush] keeps the connection up while
-     * the app stays in the background, counted from when it comes online, so
-     * waiting messages arrive before it closes again. Not used with
-     * [BackgroundMode.STAY_CONNECTED].
+     * The longest a [ConnectionSupervisor.wakeForPush] keeps the connection up
+     * while the app stays in the background, counted from the push. Later
+     * pushes during the same wake do not extend it. The session is then closed
+     * cleanly, so the server marks the account offline and pushes again.
+     *
+     * It counts from the push because the OS gives a background app network
+     * access only briefly after one: about 30 s for a high-priority FCM message
+     * on Android. A close that comes after that cannot reach the server, which
+     * then keeps a resumable session and holds new messages without pushing.
+     * Not used with [BackgroundMode.STAY_CONNECTED].
      */
-    val pushWakeMillis: Long = 30_000,
+    val pushWakeMillis: Long = 20_000,
+    /**
+     * A push wake closes early once the stream has been quiet this long (see
+     * [LiveSession.awaitQuiet]): the waiting messages are in, so the server can
+     * go back to pushing sooner. 0 keeps the connection up for [pushWakeMillis].
+     */
+    val pushQuietMillis: Long = 3_000,
 ) {
     init {
         require(baseDelayMillis > 0 && maxDelayMillis >= baseDelayMillis) { "Invalid backoff bounds" }
         require(backgroundMaxDelayMillis >= baseDelayMillis) { "Invalid background backoff" }
         require(probeTimeoutMillis > 0 && backgroundProbeTimeoutMillis > 0 && stableSessionMillis >= 0) { "Invalid timeouts" }
-        require(gracefulCloseMillis >= 0 && backgroundCloseDelayMillis >= 0 && pushWakeMillis > 0)
+        require(gracefulCloseMillis >= 0 && backgroundCloseDelayMillis >= 0 && pushWakeMillis > 0 && pushQuietMillis >= 0)
     }
 }
 
@@ -228,7 +253,8 @@ public class ConnectionSupervisor(
         class KeepaliveDue(val token: Long) : Intent
         class Foreground(val foreground: Boolean) : Intent
         class BackgroundDue(val token: Long) : Intent
-        class PushWake(val result: CompletableDeferred<ConnectResult>) : Intent
+        class PushWake(val result: CompletableDeferred<ConnectResult>, val elapsedMillis: Long) : Intent
+        class PushQuiet(val token: Long, val epoch: Long) : Intent
     }
 
     // Everything below is touched only by the actor coroutine.
@@ -254,8 +280,11 @@ public class ConnectionSupervisor(
     private var foreground = true
     private var backgroundJob: Job? = null
     private var backgroundToken = 0L
-    /** The background timer is a [wakeForPush] hold, restarted when the session comes online. */
+    /** The background timer is a [wakeForPush] deadline, fixed from the first push of the wake. */
     private var pushHold = false
+    /** The current push wake has been online, so a lost connection ends it instead of retrying. */
+    private var pushOnline = false
+    private var quietJob: Job? = null
     private val waiters = ArrayList<CompletableDeferred<ConnectResult>>()
 
     private val actor = scope.launch {
@@ -281,14 +310,24 @@ public class ConnectionSupervisor(
     /**
      * Handles a push notification: connects (also in the background, and also
      * when [connect] was never called, as in a process the push just started),
-     * so messages waiting on the server arrive. While the app stays in the
-     * background the connection closes again [ReconnectPolicy.pushWakeMillis]
-     * after it comes online, as [BackgroundMode] asks, so the server goes back
-     * to sending pushes. Coming to the foreground meanwhile keeps it open.
+     * so messages waiting on the server arrive.
+     *
+     * While the app stays in the background the session is closed cleanly, as
+     * [BackgroundMode] asks, once the stream goes quiet
+     * ([ReconnectPolicy.pushQuietMillis]) or at the latest
+     * [ReconnectPolicy.pushWakeMillis] after the push, so the server goes back
+     * to sending pushes. Further pushes during the wake do not extend it, and a
+     * connection lost after coming online is not retried until the next push or
+     * the foreground: the OS has most likely taken the network away. Coming to
+     * the foreground meanwhile keeps the connection open.
+     *
+     * @param elapsedSincePushMillis how long ago the push arrived, when the app
+     *   calls this late (for example after starting the process), so the wake
+     *   still ends inside the OS's network window.
      */
-    public suspend fun wakeForPush(): ConnectResult {
+    public suspend fun wakeForPush(elapsedSincePushMillis: Long = 0): ConnectResult {
         val result = CompletableDeferred<ConnectResult>()
-        if (intents.trySend(Intent.PushWake(result)).isFailure) return ConnectResult.Cancelled
+        if (intents.trySend(Intent.PushWake(result, elapsedSincePushMillis.coerceAtLeast(0))).isFailure) return ConnectResult.Cancelled
         return result.await()
     }
 
@@ -369,12 +408,16 @@ public class ConnectionSupervisor(
             is Intent.Foreground -> onForeground(intent.foreground)
             is Intent.PushWake -> {
                 onConnect(intent.result)
-                holdForPush()
+                holdForPush(intent.elapsedMillis)
             }
             is Intent.BackgroundDue -> if (intent.token == backgroundToken && !foreground && wanted) {
                 backgroundJob = null
-                pushHold = false
-                if (_state.value != ConnectionState.Paused && _state.value !is ConnectionState.Terminal) pause()
+                endBackgroundWait()
+            }
+            is Intent.PushQuiet -> if (intent.token == backgroundToken && intent.epoch == epoch && pushHold && !foreground && wanted) {
+                quietJob = null
+                cancelBackgroundTimer()
+                endBackgroundWait()
             }
         }
     }
@@ -412,17 +455,54 @@ public class ConnectionSupervisor(
         backgroundJob = null
         backgroundToken++
         pushHold = false
+        pushOnline = false
+        quietJob?.cancel()
+        quietJob = null
     }
 
-    /** In the background, closes again [ReconnectPolicy.pushWakeMillis] from now. */
-    private fun holdForPush() {
+    private fun endBackgroundWait() {
+        pushHold = false
+        pushOnline = false
+        if (_state.value != ConnectionState.Paused && _state.value !is ConnectionState.Terminal) pause()
+    }
+
+    /**
+     * In the background, closes again [ReconnectPolicy.pushWakeMillis] after the
+     * push, or sooner once the stream is quiet. A push during a wake that is
+     * already running leaves its deadline alone: the OS's network window counts
+     * from the first push, not from the latest.
+     */
+    private fun holdForPush(elapsedMillis: Long) {
         if (foreground || !wanted || policy.backgroundMode == BackgroundMode.STAY_CONNECTED) return
+        if (pushHold && backgroundJob != null) return
         cancelBackgroundTimer()
         pushHold = true
         val token = backgroundToken
+        val delayMillis = (policy.pushWakeMillis - elapsedMillis).coerceAtLeast(0)
         backgroundJob = scope.launch {
-            delay(policy.pushWakeMillis)
+            delay(delayMillis)
             deliver(Intent.BackgroundDue(token))
+        }
+        if (_state.value is ConnectionState.Online) onPushOnline()
+    }
+
+    /** The push wake is online: from now on a loss ends it, and quiet closes it early. */
+    private fun onPushOnline() {
+        pushOnline = true
+        val live = session ?: return
+        if (policy.pushQuietMillis == 0L) return
+        quietJob?.cancel()
+        val token = backgroundToken
+        val myEpoch = epoch
+        quietJob = scope.launch {
+            try {
+                live.awaitQuiet(policy.pushQuietMillis)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                return@launch // The session ended; the supervisor hears about it on its own.
+            }
+            deliver(Intent.PushQuiet(token, myEpoch))
         }
     }
 
@@ -439,13 +519,25 @@ public class ConnectionSupervisor(
         completeWaiters(ConnectResult.Cancelled)
     }
 
-    /** In the background with a closing mode, a lost connection waits for the foreground instead of retrying. */
+    /**
+     * In the background with a closing mode, a lost connection waits for the
+     * foreground (or the next push) instead of retrying. That includes a push
+     * wake that was already online: the OS has most likely taken the network
+     * away, and retries could not reach the server before the wake ends anyway.
+     */
     private val pausedByBackground: Boolean
-        get() = !foreground && backgroundJob == null && policy.backgroundMode != BackgroundMode.STAY_CONNECTED
+        get() = !foreground && policy.backgroundMode != BackgroundMode.STAY_CONNECTED && (backgroundJob == null || pushOnline)
+
+    /** Goes to [ConnectionState.Paused] after losing the connection in the background. */
+    private fun pauseAfterLoss() {
+        cancelBackgroundTimer() // Ends a push wake: nothing is left to close.
+        set(ConnectionState.Paused)
+    }
 
     private fun onDisconnect(done: CompletableDeferred<Unit>) {
         wanted = false
         pushHold = false
+        pushOnline = false
         closeSessionGracefully(done)
         stopEverything()
         set(ConnectionState.Idle)
@@ -591,8 +683,6 @@ public class ConnectionSupervisor(
             set(ConnectionState.Online(opened.jid))
             completeWaiters(ConnectResult.Connected(opened.jid))
             scheduleKeepalive()
-            // The hold counts from now, so a slow connect still leaves time for waiting messages.
-            if (pushHold) holdForPush()
             val myEpoch = epoch
             watchJob = scope.launch {
                 val cause = try {
@@ -604,6 +694,7 @@ public class ConnectionSupervisor(
                 }
                 deliver(Intent.SessionEnded(myEpoch, cause))
             }
+            if (pushHold) onPushOnline()
             return
         }
         val error = done.error ?: IllegalStateException("Attempt returned neither a session nor an error")
@@ -620,7 +711,7 @@ public class ConnectionSupervisor(
         dropSession()
         when {
             cause != null && isTerminal(cause) -> stopTerminal(cause)
-            pausedByBackground -> set(ConnectionState.Paused)
+            pausedByBackground -> pauseAfterLoss()
             livedMillis < policy.stableSessionMillis -> {
                 failures++
                 scheduleRetry(cause)
@@ -645,7 +736,7 @@ public class ConnectionSupervisor(
         if (idle) keepalive?.onIdleDeath(networkKind)
         dropSession()
         failures = 0
-        if (pausedByBackground) set(ConnectionState.Paused) else startAttempt() // Waits for the network if there is none.
+        if (pausedByBackground) pauseAfterLoss() else startAttempt() // Waits for the network if there is none.
     }
 
     private fun probe(idle: Boolean = false) {
@@ -717,6 +808,8 @@ public class ConnectionSupervisor(
     private fun dropSession() {
         watchJob?.cancel()
         watchJob = null
+        quietJob?.cancel()
+        quietJob = null
         probeJob?.cancel()
         probeJob = null
         probeIsIdle = false
@@ -752,6 +845,7 @@ public class ConnectionSupervisor(
         timerJob?.cancel()
         keepaliveJob?.cancel()
         backgroundJob?.cancel()
+        quietJob?.cancel()
         watchJob?.cancel()
         probeJob?.cancel()
         session?.close()

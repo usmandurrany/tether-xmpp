@@ -5,6 +5,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
@@ -28,6 +29,8 @@ internal class FakeServer(private val scope: CoroutineScope) {
     var nextFailure: (() -> Throwable?) = { null }
     var probeAnswers: () -> Boolean = { true }
     var probeDelayMillis = 50L
+    /** How long after it is asked a session reports itself quiet; null never does. */
+    var quietAfterMillis: Long? = null
 
     var opensStarted = 0
     var opensInFlight = 0
@@ -69,6 +72,12 @@ internal class FakeServer(private val scope: CoroutineScope) {
                 probesInFlight--
                 if (!ok) probeFailed = true // Includes a probe cut off by the timeout.
             }
+        }
+
+        override suspend fun awaitQuiet(quietMillis: Long) {
+            val after = quietAfterMillis ?: awaitCancellation()
+            delay(after)
+            check(!closed) { "closed" }
         }
 
         override suspend fun closeGracefully() {
@@ -484,28 +493,155 @@ class ConnectionSupervisorTest {
     }
 
     @Test
-    fun aPushWakeConnectsInTheBackgroundAndClosesAgainAfterTheHold() = runTest {
+    fun aPushWakeConnectsInTheBackgroundAndClosesAgainAtTheDeadline() = runTest {
         val server = FakeServer(backgroundScope)
         server.backgrounded = true
-        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 0, pushWakeMillis = 30_000))
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 0, pushWakeMillis = 20_000))
         sup.setForeground(false)
         // A process started by the push: connect() was never called.
         assertIs<ConnectResult.Connected>(sup.wakeForPush())
-        settle(29_000)
+        settle(19_000)
         assertIs<ConnectionState.Online>(sup.state.value, "held open for waiting messages")
         settle(2_000)
         assertEquals(ConnectionState.Paused, sup.state.value)
         assertTrue(server.sessions[0].closedGracefully, "closed politely, so the server pushes again")
 
-        // A second push reconnects; a push while online extends the hold.
+        // The next push after the wake ended starts a new wake with its own deadline.
         assertIs<ConnectResult.Connected>(sup.wakeForPush())
-        settle(20_000)
-        assertIs<ConnectResult.Connected>(sup.wakeForPush())
-        settle(20_000)
+        settle(19_000)
         assertIs<ConnectionState.Online>(sup.state.value)
-        settle(15_000)
+        settle(2_000)
         assertEquals(ConnectionState.Paused, sup.state.value)
         assertEquals(2, server.opensStarted)
+    }
+
+    @Test
+    fun theDeadlineCountsFromTheFirstPushNotFromOnlineOrLaterPushes() = runTest {
+        val server = FakeServer(backgroundScope)
+        server.backgrounded = true
+        server.openDelayMillis = 12_000 // A slow connect, as on a phone waking up.
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 0, pushWakeMillis = 20_000))
+        sup.setForeground(false)
+        val first = async { sup.wakeForPush() }
+        settle(5_000)
+        val second = async { sup.wakeForPush() }
+        settle(5_000)
+        val third = async { sup.wakeForPush() }
+        settle(5_000) // 15 s: online since 12 s.
+        assertIs<ConnectionState.Online>(sup.state.value)
+        assertIs<ConnectResult.Connected>(sup.wakeForPush()) // Yet another push while online.
+        settle(4_000) // 19 s
+        assertIs<ConnectionState.Online>(sup.state.value)
+        settle(2_000) // 21 s: 20 s after the first push, not 20 s after online or the last push.
+        assertEquals(ConnectionState.Paused, sup.state.value)
+        assertTrue(server.sessions[0].closedGracefully)
+        listOf(first, second, third).forEach { assertIs<ConnectResult.Connected>(it.await()) }
+        assertEquals(1, server.opensStarted)
+    }
+
+    @Test
+    fun aLatePushWakeKeepsTheDeadlineOfThePush() = runTest {
+        val server = FakeServer(backgroundScope)
+        server.backgrounded = true
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 0, pushWakeMillis = 20_000))
+        sup.setForeground(false)
+        sup.wakeForPush(elapsedSincePushMillis = 8_000)
+        settle(11_000)
+        assertIs<ConnectionState.Online>(sup.state.value)
+        settle(2_000)
+        assertEquals(ConnectionState.Paused, sup.state.value)
+    }
+
+    @Test
+    fun aPushWakeClosesEarlyOnceTheStreamIsQuiet() = runTest {
+        val server = FakeServer(backgroundScope)
+        server.backgrounded = true
+        server.openDelayMillis = 2_000
+        server.quietAfterMillis = 3_000
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 0, pushWakeMillis = 20_000))
+        sup.setForeground(false)
+        val result = async { sup.wakeForPush() }
+        settle(4_500)
+        assertIs<ConnectResult.Connected>(result.await())
+        assertIs<ConnectionState.Online>(sup.state.value, "the messages are still coming in")
+        settle(1_000) // Online at 2 s, quiet 3 s later.
+        assertEquals(ConnectionState.Paused, sup.state.value)
+        assertTrue(server.sessions[0].closedGracefully)
+        // The old deadline does nothing to the next wake.
+        server.quietAfterMillis = null
+        sup.wakeForPush() // Online 2 s after this push.
+        settle(17_000)
+        assertIs<ConnectionState.Online>(sup.state.value)
+        settle(2_000)
+        assertEquals(ConnectionState.Paused, sup.state.value)
+    }
+
+    @Test
+    fun earlyCloseCanBeTurnedOff() = runTest {
+        val server = FakeServer(backgroundScope)
+        server.backgrounded = true
+        server.quietAfterMillis = 1_000
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 0, pushWakeMillis = 20_000, pushQuietMillis = 0))
+        sup.setForeground(false)
+        sup.wakeForPush()
+        settle(19_000)
+        assertIs<ConnectionState.Online>(sup.state.value)
+    }
+
+    @Test
+    fun aConnectionLostDuringAPushWakeIsNotRetried() = runTest {
+        val server = FakeServer(backgroundScope)
+        server.backgrounded = true
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 0, pushWakeMillis = 20_000))
+        sup.setForeground(false)
+        assertIs<ConnectResult.Connected>(sup.wakeForPush())
+        settle(5_000)
+        server.sessions[0].drop(lost()) // The OS took the network away.
+        settle(1_000)
+        assertEquals(ConnectionState.Paused, sup.state.value)
+        settle(60_000)
+        assertEquals(1, server.opensStarted, "no retries into a network the OS has cut off")
+
+        // A failed probe ends it the same way.
+        assertIs<ConnectResult.Connected>(sup.wakeForPush())
+        server.probeAnswers = { false }
+        sup.networkChanged(false, null)
+        settle(30_000)
+        assertEquals(ConnectionState.Paused, sup.state.value)
+        assertEquals(2, server.opensStarted)
+
+        // The next push connects again.
+        server.probeAnswers = { true }
+        sup.networkChanged(true, "wifi")
+        assertIs<ConnectResult.Connected>(sup.wakeForPush())
+        assertEquals(3, server.opensStarted)
+    }
+
+    @Test
+    fun aPushWakeStillRetriesUntilItFirstComesOnline() = runTest {
+        val server = FakeServer(backgroundScope)
+        server.backgrounded = true
+        var failures = 2
+        server.nextFailure = { if (failures-- > 0) lost() else null }
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 0, pushWakeMillis = 20_000))
+        sup.setForeground(false)
+        assertIs<ConnectResult.Connected>(sup.wakeForPush())
+        assertEquals(3, server.opensStarted)
+    }
+
+    @Test
+    fun aPushDuringTheBackgroundGraceTurnsItIntoAPushWake() = runTest {
+        val server = FakeServer(backgroundScope)
+        server.quietAfterMillis = 3_000
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 60_000))
+        sup.connect()
+        server.backgrounded = true
+        sup.setForeground(false)
+        settle(1_000)
+        assertIs<ConnectResult.Connected>(sup.wakeForPush())
+        settle(4_000)
+        assertEquals(ConnectionState.Paused, sup.state.value)
+        assertEquals(1, server.opensStarted)
     }
 
     @Test
@@ -533,10 +669,12 @@ class ConnectionSupervisorTest {
         val server = FakeServer(backgroundScope)
         server.backgrounded = true
         server.openDelayMillis = 120_000
-        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 0, pushWakeMillis = 30_000))
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 0, pushWakeMillis = 20_000))
         sup.setForeground(false)
         val result = async { sup.wakeForPush() }
-        settle(31_000)
+        settle(19_000)
+        assertIs<ConnectionState.Connecting>(sup.state.value)
+        settle(2_000)
         assertEquals(ConnectionState.Paused, sup.state.value)
         assertEquals(ConnectResult.Cancelled, result.await())
     }
@@ -577,6 +715,7 @@ class ConnectionSupervisorTest {
         }
         server.probeAnswers = { rnd.nextInt(4) != 0 }
         server.probeDelayMillis = rnd.nextLong(1, 15_000)
+        server.quietAfterMillis = if (rnd.nextBoolean()) rnd.nextLong(1, 10_000) else null
         val mode = BackgroundMode.entries[seed % BackgroundMode.entries.size]
         val sup = ConnectionSupervisor(
             backgroundScope, server.opener,
@@ -593,7 +732,7 @@ class ConnectionSupervisorTest {
         val networks = listOf("wifi", "cellular", "wifi-2")
 
         repeat(120) {
-            when (rnd.nextInt(9)) {
+            when (rnd.nextInt(10)) {
                 0, 1 -> callers += async { sup.connect() }
                 2 -> sup.wake()
                 3 -> sup.networkChanged(rnd.nextInt(5) != 0, networks.random(rnd))
@@ -608,6 +747,7 @@ class ConnectionSupervisorTest {
                     server.backgrounded = !fg
                     sup.setForeground(fg)
                 }
+                7 -> callers += async { sup.wakeForPush(rnd.nextLong(0, 10_000)) }
                 else -> Unit
             }
             advanceTimeBy(rnd.nextLong(0, 4_000))

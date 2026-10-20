@@ -201,9 +201,9 @@ public class XmppClient(
     }
 
     /** Call when a push notification arrives; see [ConnectionSupervisor.wakeForPush]. */
-    public suspend fun wakeForPush(): ConnectResult {
+    public suspend fun wakeForPush(elapsedSincePushMillis: Long = 0): ConnectResult {
         restore()
-        return supervisor.wakeForPush()
+        return supervisor.wakeForPush(elapsedSincePushMillis)
     }
 
     public suspend fun disconnect() {
