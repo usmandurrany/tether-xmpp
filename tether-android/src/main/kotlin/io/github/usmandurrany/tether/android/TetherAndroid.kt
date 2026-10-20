@@ -89,7 +89,8 @@ public object TetherAndroid {
      * Logs in with [password] when given (the first time), otherwise with the
      * keys the last login saved in [store]; throws [IllegalArgumentException]
      * when there are none. Use `CredentialVault(store).hasKeys(jid)` to decide
-     * whether to ask for the password.
+     * whether to ask for the password. With [rememberLogin] off, the keys are not
+     * kept (and keys from an earlier login are deleted).
      */
     public suspend fun chat(
         context: Context,
@@ -102,19 +103,22 @@ public object TetherAndroid {
         /** Keeps messages, ticks and deletions between runs; null keeps them in memory only. */
         messageStore: MessageStore? = SqliteMessageStore(context, jid),
         logger: TrafficLogger? = null,
+        rememberLogin: Boolean = true,
     ): TetherChat {
         val vault = CredentialVault(store)
         val config = options.configFor(jid, password, vault)
+        if (!rememberLogin) vault.clear(jid)
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val client = XmppClient(negotiator(context, config, logger), scope, policy, store = store, credentials = vault)
+        val client = XmppClient(negotiator(context, config, logger), scope, policy, store = store, credentials = vault.takeIf { rememberLogin })
         val binding = bind(context, client, scope)
         return TetherChat(client, features, store, messageStore, resources = binding)
     }
 
     /**
      * A client wired for Android: Android DNS and TLS, the app lifecycle and
-     * network fed in, state and login keys kept in [store]. Keep one per
-     * account for the life of the process, in an application-wide scope.
+     * network fed in, state and login keys kept in [store] (the keys only with
+     * [rememberLogin]). Keep one per account for the life of the process, in an
+     * application-wide scope.
      */
     public fun client(
         context: Context,
@@ -123,13 +127,16 @@ public object TetherAndroid {
         policy: ClientPolicy = ClientPolicy(),
         store: KeyValueStore = secureStore(context),
         logger: TrafficLogger? = null,
+        rememberLogin: Boolean = true,
     ): XmppClient {
+        val vault = CredentialVault(store)
+        if (!rememberLogin) scope.launch { runCatching { vault.clear(config.jid) } }
         val client = XmppClient(
             negotiator(context, config, logger),
             scope,
             policy,
             store = store,
-            credentials = CredentialVault(store),
+            credentials = vault.takeIf { rememberLogin },
         )
         bind(context, client, scope)
         return client
