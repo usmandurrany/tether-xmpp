@@ -32,6 +32,45 @@ public data class PushTarget(
     val createNode: Boolean = false,
 )
 
+/**
+ * A push app server that gives each device its node through an ad-hoc command
+ * (XEP-0050): the client sends the device token, and the answer holds the node
+ * and any secret for [Push.register]. Use a preset for a known server, or name
+ * the [command] and [fields] for another.
+ */
+public data class PushAppServer(
+    /** The app server's address, such as `p2.example.com`. */
+    val jid: String,
+    /** The ad-hoc command's node, such as `register-push-fcm`. */
+    val command: String,
+    /** What to fill in: the device token and anything else the command asks for. */
+    val fields: Map<String, String>,
+) {
+    public companion object {
+        /**
+         * Conversations' open-source app server, p2, and servers compatible with
+         * it. [deviceId] is a stable id for this install (Conversations uses the
+         * Android ID); the answer's `secret` goes along with every notification.
+         */
+        public fun p2(jid: String, fcmToken: String, deviceId: String): PushAppServer =
+            PushAppServer(jid, "register-push-fcm", mapOf("token" to fcmToken, "android-id" to deviceId))
+
+        /** Openfire's Push Server plugin (FCM). */
+        public fun openfire(jid: String, fcmToken: String, deviceId: String): PushAppServer =
+            PushAppServer(jid, "register-push-fcm", mapOf("token" to fcmToken, "device-id" to deviceId))
+
+        /**
+         * Tigase's Push component. [provider] names the push service and app it
+         * was configured with, `fcm-xmpp-api` for FCM in its default setup.
+         */
+        public fun tigase(jid: String, deviceToken: String, provider: String = "fcm-xmpp-api"): PushAppServer =
+            PushAppServer(jid, "register-device", mapOf("provider" to provider, "device-token" to deviceToken))
+    }
+}
+
+/** An app server's ad-hoc command was refused or gave no node. */
+public class PushRegistrationException(message: String, public val condition: String? = null) : Exception(message)
+
 public sealed interface PushState {
     /** Nothing registered. */
     public data object Off : PushState
@@ -100,6 +139,62 @@ public class Push(private val client: StanzaSender) : ClientExtension {
             }
         }
     }
+
+    /**
+     * Gets a node for this device from [appServer], then registers it as
+     * [register] does. Needs a connection: the command goes to the app server
+     * through the account's server. Call again whenever the device token
+     * changes. Throws [PushRegistrationException] if the app server refuses.
+     */
+    public suspend fun register(appServer: PushAppServer): PushTarget {
+        val target = provision(appServer)
+        register(target)
+        return target
+    }
+
+    /**
+     * Runs [appServer]'s command and reads the node from the answer. Some
+     * servers take the filled-in form with `execute`; others answer it with a
+     * blank form first, which is then submitted in the same command session.
+     */
+    private suspend fun provision(appServer: PushAppServer): PushTarget {
+        var answer = client.request(command(appServer, action = "execute", sessionId = null))
+        var command = answer.child("command", ImNs.COMMANDS)
+        if (answer.attribute("type") == "result" && command?.attribute("status") == "executing") {
+            answer = client.request(command(appServer, action = "complete", sessionId = command.attribute("sessionid")))
+            command = answer.child("command", ImNs.COMMANDS)
+        }
+        if (answer.attribute("type") != "result") {
+            val condition = errorCondition(answer)
+            throw PushRegistrationException("${appServer.jid} refused ${appServer.command}: ${condition ?: "unknown error"}", condition)
+        }
+        val values = command?.child("x", ImNs.DATA_FORMS)?.children("field", ImNs.DATA_FORMS).orEmpty()
+            .mapNotNull { field -> field.attribute("var")?.let { it to field.child("value", ImNs.DATA_FORMS)?.text.orEmpty() } }
+            .toMap()
+        val node = values["node"]?.ifEmpty { null }
+            ?: throw PushRegistrationException("${appServer.jid} gave no node for ${appServer.command}")
+        // Everything else in the answer (p2's secret, say) is sent back with each notification.
+        val options = values.filterKeys { it != "node" && it != "jid" && it != "FORM_TYPE" }.filterValues { it.isNotEmpty() }
+        return PushTarget(service = values["jid"]?.ifEmpty { null } ?: appServer.jid, node = node, publishOptions = options)
+    }
+
+    private fun command(appServer: PushAppServer, action: String, sessionId: String?) =
+        iq("set", to = appServer.jid) {
+            element("command", ImNs.COMMANDS) {
+                attribute("node", appServer.command)
+                attribute("action", action)
+                attribute("sessionid", sessionId)
+                element("x", ImNs.DATA_FORMS) {
+                    attribute("type", "submit")
+                    appServer.fields.forEach { (name, value) ->
+                        element("field") {
+                            attribute("var", name)
+                            element("value") { text(value) }
+                        }
+                    }
+                }
+            }
+        }
 
     /** Stops notifications for this device, for example on logout. */
     public suspend fun unregister() {

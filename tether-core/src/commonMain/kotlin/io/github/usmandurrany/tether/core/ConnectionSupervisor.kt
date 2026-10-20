@@ -105,7 +105,11 @@ public sealed interface ConnectResult {
         val untrustedCertificate: String?
             get() = generateSequence(error) { it.cause }.filterIsInstance<TlsVerificationException>().firstNotNullOfOrNull { it.peerCertificateSha256 }
     }
-    /** [ConnectionSupervisor.disconnect] was called before the connection came up. */
+    /**
+     * [ConnectionSupervisor.disconnect] was called before the connection came
+     * up, or the app was in the background and the connection was closed for it
+     * first (see [BackgroundMode]).
+     */
     public data object Cancelled : ConnectResult
 }
 
@@ -156,12 +160,19 @@ public data class ReconnectPolicy(
      * disconnect, a push, and a reconnect. 0 closes immediately.
      */
     val backgroundCloseDelayMillis: Long = 5_000,
+    /**
+     * How long [ConnectionSupervisor.wakeForPush] keeps the connection up while
+     * the app stays in the background, counted from when it comes online, so
+     * waiting messages arrive before it closes again. Not used with
+     * [BackgroundMode.STAY_CONNECTED].
+     */
+    val pushWakeMillis: Long = 30_000,
 ) {
     init {
         require(baseDelayMillis > 0 && maxDelayMillis >= baseDelayMillis) { "Invalid backoff bounds" }
         require(backgroundMaxDelayMillis >= baseDelayMillis) { "Invalid background backoff" }
         require(probeTimeoutMillis > 0 && backgroundProbeTimeoutMillis > 0 && stableSessionMillis >= 0) { "Invalid timeouts" }
-        require(gracefulCloseMillis >= 0 && backgroundCloseDelayMillis >= 0)
+        require(gracefulCloseMillis >= 0 && backgroundCloseDelayMillis >= 0 && pushWakeMillis > 0)
     }
 }
 
@@ -217,6 +228,7 @@ public class ConnectionSupervisor(
         class KeepaliveDue(val token: Long) : Intent
         class Foreground(val foreground: Boolean) : Intent
         class BackgroundDue(val token: Long) : Intent
+        class PushWake(val result: CompletableDeferred<ConnectResult>) : Intent
     }
 
     // Everything below is touched only by the actor coroutine.
@@ -242,6 +254,8 @@ public class ConnectionSupervisor(
     private var foreground = true
     private var backgroundJob: Job? = null
     private var backgroundToken = 0L
+    /** The background timer is a [wakeForPush] hold, restarted when the session comes online. */
+    private var pushHold = false
     private val waiters = ArrayList<CompletableDeferred<ConnectResult>>()
 
     private val actor = scope.launch {
@@ -261,6 +275,20 @@ public class ConnectionSupervisor(
     public suspend fun connect(): ConnectResult {
         val result = CompletableDeferred<ConnectResult>()
         if (intents.trySend(Intent.Connect(result)).isFailure) return ConnectResult.Cancelled
+        return result.await()
+    }
+
+    /**
+     * Handles a push notification: connects (also in the background, and also
+     * when [connect] was never called, as in a process the push just started),
+     * so messages waiting on the server arrive. While the app stays in the
+     * background the connection closes again [ReconnectPolicy.pushWakeMillis]
+     * after it comes online, as [BackgroundMode] asks, so the server goes back
+     * to sending pushes. Coming to the foreground meanwhile keeps it open.
+     */
+    public suspend fun wakeForPush(): ConnectResult {
+        val result = CompletableDeferred<ConnectResult>()
+        if (intents.trySend(Intent.PushWake(result)).isFailure) return ConnectResult.Cancelled
         return result.await()
     }
 
@@ -339,8 +367,13 @@ public class ConnectionSupervisor(
                 probe(idle = true)
             }
             is Intent.Foreground -> onForeground(intent.foreground)
+            is Intent.PushWake -> {
+                onConnect(intent.result)
+                holdForPush()
+            }
             is Intent.BackgroundDue -> if (intent.token == backgroundToken && !foreground && wanted) {
                 backgroundJob = null
+                pushHold = false
                 if (_state.value != ConnectionState.Paused && _state.value !is ConnectionState.Terminal) pause()
             }
         }
@@ -378,6 +411,19 @@ public class ConnectionSupervisor(
         backgroundJob?.cancel()
         backgroundJob = null
         backgroundToken++
+        pushHold = false
+    }
+
+    /** In the background, closes again [ReconnectPolicy.pushWakeMillis] from now. */
+    private fun holdForPush() {
+        if (foreground || !wanted || policy.backgroundMode == BackgroundMode.STAY_CONNECTED) return
+        cancelBackgroundTimer()
+        pushHold = true
+        val token = backgroundToken
+        backgroundJob = scope.launch {
+            delay(policy.pushWakeMillis)
+            deliver(Intent.BackgroundDue(token))
+        }
     }
 
     /** Closes the connection on purpose for the background, keeping [wanted]. */
@@ -389,6 +435,8 @@ public class ConnectionSupervisor(
         cancelAttempt()
         cancelTimer()
         set(ConnectionState.Paused)
+        // Callers waiting on an attempt the background just stopped would otherwise wait for the foreground.
+        completeWaiters(ConnectResult.Cancelled)
     }
 
     /** In the background with a closing mode, a lost connection waits for the foreground instead of retrying. */
@@ -397,6 +445,7 @@ public class ConnectionSupervisor(
 
     private fun onDisconnect(done: CompletableDeferred<Unit>) {
         wanted = false
+        pushHold = false
         closeSessionGracefully(done)
         stopEverything()
         set(ConnectionState.Idle)
@@ -542,6 +591,8 @@ public class ConnectionSupervisor(
             set(ConnectionState.Online(opened.jid))
             completeWaiters(ConnectResult.Connected(opened.jid))
             scheduleKeepalive()
+            // The hold counts from now, so a slow connect still leaves time for waiting messages.
+            if (pushHold) holdForPush()
             val myEpoch = epoch
             watchJob = scope.launch {
                 val cause = try {
@@ -713,6 +764,7 @@ public class ConnectionSupervisor(
             when (leftover) {
                 is Intent.AttemptDone -> leftover.session?.close()
                 is Intent.Connect -> leftover.result.complete(ConnectResult.Cancelled)
+                is Intent.PushWake -> leftover.result.complete(ConnectResult.Cancelled)
                 is Intent.Disconnect -> leftover.done.complete(Unit)
                 else -> Unit
             }

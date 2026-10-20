@@ -21,6 +21,7 @@ internal object ImNs {
     const val RSM = "http://jabber.org/protocol/rsm"
     const val DATA_FORMS = "jabber:x:data"
     const val PUSH = "urn:xmpp:push:0"
+    const val COMMANDS = "http://jabber.org/protocol/commands"
     const val STANZAS = "urn:ietf:params:xml:ns:xmpp-stanzas"
     const val RETRACT = "urn:xmpp:message-retract:1"
     const val FALLBACK = "urn:xmpp:fallback:0"

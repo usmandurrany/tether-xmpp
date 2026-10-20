@@ -484,6 +484,64 @@ class ConnectionSupervisorTest {
     }
 
     @Test
+    fun aPushWakeConnectsInTheBackgroundAndClosesAgainAfterTheHold() = runTest {
+        val server = FakeServer(backgroundScope)
+        server.backgrounded = true
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 0, pushWakeMillis = 30_000))
+        sup.setForeground(false)
+        // A process started by the push: connect() was never called.
+        assertIs<ConnectResult.Connected>(sup.wakeForPush())
+        settle(29_000)
+        assertIs<ConnectionState.Online>(sup.state.value, "held open for waiting messages")
+        settle(2_000)
+        assertEquals(ConnectionState.Paused, sup.state.value)
+        assertTrue(server.sessions[0].closedGracefully, "closed politely, so the server pushes again")
+
+        // A second push reconnects; a push while online extends the hold.
+        assertIs<ConnectResult.Connected>(sup.wakeForPush())
+        settle(20_000)
+        assertIs<ConnectResult.Connected>(sup.wakeForPush())
+        settle(20_000)
+        assertIs<ConnectionState.Online>(sup.state.value)
+        settle(15_000)
+        assertEquals(ConnectionState.Paused, sup.state.value)
+        assertEquals(2, server.opensStarted)
+    }
+
+    @Test
+    fun theForegroundDuringAPushHoldKeepsTheConnection() = runTest {
+        val server = FakeServer(backgroundScope)
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 0))
+        sup.setForeground(false)
+        sup.wakeForPush()
+        sup.setForeground(true)
+        settle(10 * 60_000)
+        assertIs<ConnectionState.Online>(sup.state.value)
+    }
+
+    @Test
+    fun aPushWakeInTheForegroundIsAPlainConnect() = runTest {
+        val server = FakeServer(backgroundScope)
+        val sup = supervisor(server)
+        assertIs<ConnectResult.Connected>(sup.wakeForPush())
+        settle(10 * 60_000)
+        assertIs<ConnectionState.Online>(sup.state.value)
+    }
+
+    @Test
+    fun aPushWakeThatCannotConnectInTimeGivesUpAtTheEndOfTheHold() = runTest {
+        val server = FakeServer(backgroundScope)
+        server.backgrounded = true
+        server.openDelayMillis = 120_000
+        val sup = supervisor(server, policy = ReconnectPolicy(backgroundCloseDelayMillis = 0, pushWakeMillis = 30_000))
+        sup.setForeground(false)
+        val result = async { sup.wakeForPush() }
+        settle(31_000)
+        assertEquals(ConnectionState.Paused, sup.state.value)
+        assertEquals(ConnectResult.Cancelled, result.await())
+    }
+
+    @Test
     fun disconnectEndsTheStreamPolitely() = runTest {
         val server = FakeServer(backgroundScope)
         val sup = supervisor(server)

@@ -389,9 +389,21 @@ chat.registerPush(PushTarget(
 ))
 ```
 
-For ejabberd and Openfire, `service` is the push app server's JID and `node` and `publishOptions` are what it gave this device (see the `PushTarget` docs). Watch `chat.pushState`: `Unsupported` means the server has no XEP-0357 support. Tether re-registers on every new login.
+Most other servers (ejabberd, Prosody, Openfire, Tigase) only forward notifications to a separate push app server, which holds your Firebase or APNs credentials and hands each device a node. Tether asks it for one with its ad-hoc command and then registers that node, in one call. It needs a connection:
 
-When a push arrives, call `chat.client.wake()`: it checks a live connection at once, or skips the wait before the next retry.
+```kotlin
+// Conversations' p2, or a compatible app server you run with your Firebase key
+chat.registerPush(PushAppServer.p2("p2.example.com", fcmToken, deviceId = installId))
+// Tigase's push component, or Openfire's Push Server plugin
+chat.registerPush(PushAppServer.tigase("push.example.com", fcmToken))
+chat.registerPush(PushAppServer.openfire("pubsub.example.com", fcmToken, installId))
+```
+
+The app server must be yours (or run for your app): a shared one, such as `push.tigase.im` or `p2.siacs.eu`, only holds the keys of its own apps. The account's server reaches it server to server, so it needs a public domain with a valid certificate. Any other app server with an ad-hoc command works through `PushAppServer(jid, command, fields)`.
+
+Watch `chat.pushState`: `Unsupported` means the server has no XEP-0357 support. Tether re-registers on every new login. Call `registerPush` again when FCM gives a new token.
+
+When a push arrives, call `chat.wakeForPush()` from your `FirebaseMessagingService`. It connects, also when the push started the process, so waiting messages arrive in `conversations`. If the app is still in the background it closes again `ReconnectPolicy.pushWakeMillis` (30 s) after coming online, so the server goes back to pushing. Notify the user from what arrived.
 
 ## Desktop notes
 
@@ -518,7 +530,7 @@ History needs `mod_mam` (MongooseIM, ejabberd) or the Openfire Monitoring plugin
 
 ### Push notifications
 
-`im.push.register(...)` and `im.push.state`, as in [Push notifications](#push-notifications) above.
+`im.push.register(...)` (with a `PushTarget` or a `PushAppServer`) and `im.push.state`, as in [Push notifications](#push-notifications) above.
 
 ## Login options
 

@@ -3,6 +3,7 @@ package io.github.usmandurrany.tether.im
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -72,5 +73,91 @@ class PushTest {
         val disable = assertNotNull(sender.requests.last().child("disable", ImNs.PUSH))
         assertEquals("device-42", disable.attribute("node"))
         assertEquals(PushState.Off, push.state.value)
+    }
+
+    @Test
+    fun p2GivesANodeAndASecretInOneStep() = runTest {
+        val sender = FakeSender { iq ->
+            if (iq.child("command", ImNs.COMMANDS) != null) {
+                FakeSender.result(iq) {
+                    element("command", ImNs.COMMANDS) {
+                        attribute("node", "register-push-fcm")
+                        attribute("status", "completed")
+                        form("jid" to "p2.example.net", "node" to "n-1", "secret" to "s-1")
+                    }
+                }
+            } else {
+                FakeSender.result(iq)
+            }
+        }
+        val push = Push(sender)
+        push.onSessionStarted(FakeSession(sender, accountFeatures = setOf(ImNs.PUSH)))
+        val target = push.register(PushAppServer.p2("p2.example.net", "fcm-token", "install-7"))
+        assertEquals(PushTarget("p2.example.net", "n-1", mapOf("secret" to "s-1")), target)
+
+        val command = sender.requests[0].child("command", ImNs.COMMANDS)!!
+        assertEquals("p2.example.net", sender.requests[0].attribute("to"))
+        assertEquals("register-push-fcm", command.attribute("node"))
+        assertEquals("execute", command.attribute("action"))
+        assertEquals(mapOf("token" to "fcm-token", "android-id" to "install-7"), fields(command))
+        assertEquals("n-1", sender.requests[1].child("enable", ImNs.PUSH)!!.attribute("node"))
+        assertEquals(PushState.On(target), push.state.value)
+    }
+
+    @Test
+    fun aServerThatAnswersWithABlankFormGetsItSubmitted() = runTest {
+        val sender = FakeSender { iq ->
+            val command = iq.child("command", ImNs.COMMANDS)
+            when (command?.attribute("action")) {
+                "execute" -> FakeSender.result(iq) {
+                    element("command", ImNs.COMMANDS) {
+                        attribute("node", "register-device")
+                        attribute("sessionid", "sess-9")
+                        attribute("status", "executing")
+                    }
+                }
+                "complete" -> FakeSender.result(iq) {
+                    element("command", ImNs.COMMANDS) {
+                        attribute("status", "completed")
+                        form("node" to "tigase-node")
+                    }
+                }
+                else -> FakeSender.result(iq)
+            }
+        }
+        val push = Push(sender)
+        push.onSessionStarted(FakeSession(sender, accountFeatures = setOf(ImNs.PUSH)))
+        val target = push.register(PushAppServer.tigase("push.example.net", "tok"))
+        assertEquals(PushTarget("push.example.net", "tigase-node"), target)
+        val second = sender.requests[1].child("command", ImNs.COMMANDS)!!
+        assertEquals("sess-9", second.attribute("sessionid"))
+        assertEquals(mapOf("provider" to "fcm-xmpp-api", "device-token" to "tok"), fields(second))
+    }
+
+    @Test
+    fun aRefusedCommandThrowsAndRegistersNothing() = runTest {
+        val sender = FakeSender { FakeSender.error(it, "forbidden") }
+        val push = Push(sender)
+        push.onSessionStarted(FakeSession(sender, accountFeatures = setOf(ImNs.PUSH)))
+        val error = assertFailsWith<PushRegistrationException> { push.register(PushAppServer.p2("p2.example.net", "t", "d")) }
+        assertEquals("forbidden", error.condition)
+        assertEquals(1, sender.requests.size)
+        assertEquals(PushState.Off, push.state.value)
+    }
+
+    private fun fields(command: io.github.usmandurrany.tether.xml.Element): Map<String, String> =
+        command.child("x", ImNs.DATA_FORMS)!!.children("field", ImNs.DATA_FORMS)
+            .associate { it.attribute("var")!! to it.child("value", ImNs.DATA_FORMS)!!.text }
+
+    private fun io.github.usmandurrany.tether.xml.ElementBuilder.form(vararg values: Pair<String, String>) {
+        element("x", ImNs.DATA_FORMS) {
+            attribute("type", "result")
+            values.forEach { (name, value) ->
+                element("field") {
+                    attribute("var", name)
+                    element("value") { text(value) }
+                }
+            }
+        }
     }
 }
