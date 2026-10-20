@@ -114,6 +114,8 @@ chat.setPresence(Show.AWAY, "In a meeting")
 
 These need a connection and throw `XmppStanzaException` if the server refuses.
 
+To accept every request without asking, turn on `ChatFeatures(autoAcceptContacts = true)`. Each request is then approved at once and Tether asks for the requester's presence back, so both sides become contacts and `contactRequests` stays empty. It is off by default because anyone who knows the address could then see when the user is online.
+
 ### 5. Sign out
 
 ```kotlin
@@ -123,7 +125,7 @@ chat.close()     // or: just stop, keeping the login for next time
 
 ## Features
 
-Every feature is on by default. Switch off what your app does not want:
+Every feature is on by default except `autoAcceptContacts`. Switch off what your app does not want:
 
 ```kotlin
 ChatFeatures(
@@ -137,6 +139,7 @@ ChatFeatures(
     history = true,            // the server archive (XEP-0313)
     lastSeen = true,           // when offline contacts were last online (XEP-0012)
     deleteForEveryone = true,  // delete for everyone, both ways (XEP-0424)
+    autoAcceptContacts = false, // accept every contact request at once (off by default)
 )
 ```
 

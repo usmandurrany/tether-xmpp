@@ -283,7 +283,10 @@ public class TetherChat(
             }.sortedBy { it.name.lowercase() }
         }.stateIn(scope, SharingStarted.Eagerly, emptyList())
 
-    /** People asking to see our presence: answer with [approve] or [deny]. */
+    /**
+     * People asking to see our presence: answer with [approve] or [deny].
+     * Stays empty with [ChatFeatures.autoAcceptContacts] on, since every request is accepted at once.
+     */
     public val contactRequests: StateFlow<Set<BareJid>> = requests.asStateFlow()
 
     /** Outgoing work (messages, markers, typing), one at a time, so it goes out in order. */
@@ -308,7 +311,12 @@ public class TetherChat(
         scope.launch(start = CoroutineStart.UNDISPATCHED) {
             im.presences.subscriptions.collect { event ->
                 when (event) {
-                    is SubscriptionEvent.Requested -> requests.update { it + event.from }
+                    is SubscriptionEvent.Requested ->
+                        if (features.autoAcceptContacts) {
+                            scope.launch { runCatching { approve(event.from) } }
+                        } else {
+                            requests.update { it + event.from }
+                        }
                     else -> requests.update { it - event.from }
                 }
             }

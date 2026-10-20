@@ -463,4 +463,23 @@ class TetherChatTest {
         runCurrent()
         assertEquals(listOf(again.id), store.rows.values.map { it.id })
     }
+
+    @Test
+    fun contactRequestsWaitForAnAnswerByDefault() = runTest {
+        val h = harness()
+        h.chat.im.presences.onStanza(xml("<presence from='romeo@example.net' type='subscribe'/>"))
+        runCurrent()
+        assertEquals(setOf(romeo), h.chat.contactRequests.value)
+        assertTrue(h.sent().none { it.name == "presence" && it.attribute("to") == "romeo@example.net" })
+    }
+
+    @Test
+    fun autoAcceptApprovesAndAsksBack() = runTest {
+        val h = harness(ChatFeatures(autoAcceptContacts = true))
+        h.chat.im.presences.onStanza(xml("<presence from='romeo@example.net' type='subscribe'/>"))
+        runCurrent()
+        assertTrue(h.chat.contactRequests.value.isEmpty())
+        val answers = h.sent().filter { it.name == "presence" && it.attribute("to") == "romeo@example.net" }.map { it.attribute("type") }
+        assertEquals(listOf("subscribed", "subscribe"), answers)
+    }
 }

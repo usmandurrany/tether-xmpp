@@ -43,6 +43,14 @@ public data class ChatFeatures(
      * deletions are ignored and their messages stay.
      */
     val deleteForEveryone: Boolean = true,
+    /**
+     * Accept every contact request at once: the requester sees our presence and
+     * we ask to see theirs, so both become contacts. Off by default, because
+     * anyone who knows the address could then see when we are online. With it
+     * off, requests wait in [TetherChat.contactRequests] for [TetherChat.approve]
+     * or [TetherChat.deny]. Needs [presence].
+     */
+    val autoAcceptContacts: Boolean = false,
 )
 
 /**
