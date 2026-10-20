@@ -81,6 +81,14 @@ public data class ClientPolicy(
     val maxOutbox: Int = 1_000,
     /** Incoming stanzas no extension consumed, buffered for slow collectors of [XmppClient.stanzas]. */
     val stanzaBuffer: Int = 256,
+    /**
+     * After each chat message (a message with a body), ask the server to
+     * confirm at once and check that the connection answers. A connection
+     * that has silently died (a "zombie" after a network change) is then
+     * found within the probe timeout, and the message goes out again on a new
+     * one, instead of waiting for the next idle check.
+     */
+    val confirmEachMessage: Boolean = true,
 ) {
     init {
         require(maxOutbox >= 0 && stanzaBuffer >= 1)
@@ -272,14 +280,21 @@ public class XmppClient(
         require(StreamManagement.isStanza(stanza)) { "Only message, presence and iq stanzas can be sent" }
         restore() // a send before the first connect must not be saved over what an earlier run left
         val stamped = withId(stanza)
-        sending.withLock {
+        val written = sending.withLock {
             val live = _session.value
             if (live == null || !live.offer(stamped)) {
                 if (outbox.size >= policy.maxOutbox) throw OutboxFullException(stamped)
                 outbox.addLast(stamped)
+                false
+            } else {
+                true
             }
         }
         saveSoon()
+        // Not proof of delivery until the server confirms: check now rather than at the next idle probe.
+        if (written && policy.confirmEachMessage && stamped.name == "message" && stamped.child("body", Ns.CLIENT) != null) {
+            supervisor.checkConnection()
+        }
     }
 
     /**

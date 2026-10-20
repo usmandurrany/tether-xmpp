@@ -156,6 +156,16 @@ val chat = TetherAndroid.chat(context, jid, password, messageStore = RoomMessage
 
 After each new sign-in the SDK also catches up from the archive: messages sent and received on other devices while this one was offline appear, and ones read elsewhere are marked read.
 
+## When a message counts as sent
+
+A message shows SENT (one tick) only once the server has confirmed it (XEP-0198 stream management); until then it is SENDING. Nothing is dropped in between:
+
+- Unconfirmed messages stay queued. A resumed session re-sends what the server says it missed; a new session sends all of them first. The queue survives an app restart.
+- Right after each chat message the SDK asks the server to confirm and checks that the connection answers. A connection that has silently died (common after a network switch) is found within 10 seconds (20 in the background), replaced, and the message goes out again. Wake-ups, network changes and coming to the foreground check it too.
+- A re-send can reach the contact twice. `TetherChat` merges copies by message id; other apps may show both.
+
+Without stream management the server never confirms anything, so a message counts as sent once it is written. Use a server with XEP-0198 (see the [server checklist](#server-checklist)).
+
 ## Custom data in messages
 
 A message can carry your own data beside its text: a photo's link and size, a location, the id of the message it replies to. There is nothing to set up. Give the data a type name and some fields:

@@ -589,4 +589,27 @@ class ConnectionSupervisorTest {
             }
         }
     }
+
+    @Test
+    fun checkConnectionReplacesAZombieSessionWithinTheProbeTimeout() = runTest {
+        val server = FakeServer(backgroundScope)
+        val sup = supervisor(server)
+        sup.checkConnection() // not connected: nothing to check
+        settle(1_000)
+        assertEquals(0, server.probes)
+
+        sup.connect()
+        sup.checkConnection()
+        settle(1_000)
+        assertEquals(1, server.probes)
+        assertEquals(1, server.opensStarted, "a live session that answers is kept")
+
+        // The link dies silently: the next check finds it within the probe timeout and reconnects.
+        server.probeAnswers = { false }
+        sup.checkConnection()
+        settle(ReconnectPolicy().probeTimeoutMillis + 1_000)
+        assertTrue(server.sessions[0].closed)
+        assertEquals(2, server.opensStarted)
+        assertTrue(sup.state.value is ConnectionState.Online)
+    }
 }
