@@ -8,7 +8,6 @@ import io.github.usmandurrany.tether.core.FileKeyValueStore
 import io.github.usmandurrany.tether.core.KeyValueStore
 import io.github.usmandurrany.tether.core.TetherJvm
 import io.github.usmandurrany.tether.core.TrafficLogger
-import io.github.usmandurrany.tether.core.XmppClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -29,9 +28,12 @@ import java.nio.file.Path
  * [messageStore], by default `~/.tether/<account>.messages`. The client runs on its own
  * background threads until [TetherChat.close].
  *
- * Tell the chat when the window loses or gains focus with
- * `chat.client.setForeground(...)`, so read markers only go out while the user
- * can see the chat, and about network changes with `chat.client.networkChanged(...)`.
+ * Network changes are followed on their own. Tell the chat when the window
+ * loses or gains focus with `chat.client.setForeground(...)`, so read markers
+ * only go out while the user can see the chat.
+ *
+ * With [rememberLogin] off, the login keys are not kept (and keys from an
+ * earlier run are deleted), so every run needs the password.
  */
 public suspend fun TetherJvm.chat(
     jid: BareJid,
@@ -43,11 +45,11 @@ public suspend fun TetherJvm.chat(
     /** Keeps messages, ticks and deletions between runs; null keeps them in memory only. */
     messageStore: MessageStore? = FileMessageStore(defaultStorePath(jid, "messages")),
     logger: TrafficLogger? = null,
+    rememberLogin: Boolean = true,
 ): TetherChat {
-    val vault = CredentialVault(store)
-    val config = options.configFor(jid, password, vault)
+    val config = options.configFor(jid, password, CredentialVault(store))
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    val client = XmppClient(negotiator(config, logger), scope, policy, store = store, credentials = vault)
+    val client = client(config, scope, policy, store, logger, rememberLogin)
     return TetherChat(client, features, store, messageStore)
 }
 

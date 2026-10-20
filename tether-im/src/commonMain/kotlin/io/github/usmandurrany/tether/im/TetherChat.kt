@@ -609,10 +609,11 @@ public class TetherChat(
 
     /**
      * Adds [jid] to the contact list (or renames them) and asks to see their
-     * presence. Needs a connection; throws [XmppStanzaException] if the server refuses.
+     * presence. [groups] null keeps the groups they are already in. Needs a
+     * connection; throws [XmppStanzaException] if the server refuses.
      */
-    public suspend fun addContact(jid: BareJid, name: String? = null) {
-        im.roster.set(jid, name = name?.ifBlank { null })
+    public suspend fun addContact(jid: BareJid, name: String? = null, groups: Set<String>? = null) {
+        im.roster.set(jid, name = name?.ifBlank { null }, groups = groups ?: im.roster.items.value[jid]?.groups.orEmpty())
         if (features.presence && im.roster.items.value[jid]?.subscription.let { it != Subscription.TO && it != Subscription.BOTH }) {
             im.presences.request(jid)
         }
@@ -637,9 +638,13 @@ public class TetherChat(
         requests.update { it - jid }
     }
 
-    /** Changes what contacts see: away, busy, a status text. */
-    public suspend fun setPresence(show: Show? = null, status: String? = null) {
-        im.presences.set(OwnPresence(show = show, status = status))
+    /**
+     * Changes what contacts see: away, busy, a status text, now and on every
+     * later connection. [invisible] shows us offline to contacts while staying
+     * connected; any later call without it shows us again.
+     */
+    public suspend fun setPresence(show: Show? = null, status: String? = null, invisible: Boolean = false) {
+        if (invisible) im.presences.hide() else im.presences.set(OwnPresence(show = show, status = status))
     }
 
     // --- Profiles ---------------------------------------------------------------------
@@ -679,6 +684,9 @@ public class TetherChat(
     }
 
     // --- Push -------------------------------------------------------------------------
+
+    /** Whether push is on for this device, being set up, refused, or not offered by the server. */
+    public val pushState: StateFlow<PushState> get() = im.push.state
 
     /** Registers this device for push notifications; see [PushTarget] for the fields per server. */
     public suspend fun registerPush(target: PushTarget): Unit = im.push.register(target)

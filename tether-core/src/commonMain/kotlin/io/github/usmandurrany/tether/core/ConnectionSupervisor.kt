@@ -1,5 +1,6 @@
 package io.github.usmandurrany.tether.core
 
+import io.github.usmandurrany.tether.transport.TlsVerificationException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -94,7 +95,16 @@ public sealed interface ConnectionState {
 /** The outcome for one caller of [ConnectionSupervisor.connect]. */
 public sealed interface ConnectResult {
     public data class Connected(val jid: FullJid) : ConnectResult
-    public data class Failed(val error: Throwable) : ConnectResult
+    public data class Failed(val error: Throwable) : ConnectResult {
+        /**
+         * The SHA-256 fingerprint of a certificate the server presented and TLS
+         * refused (self-signed, say), or null for any other failure. To trust it,
+         * show it to the user and connect again with it in
+         * `TlsConfig(pinnedCertificateSha256 = setOf(...))`.
+         */
+        val untrustedCertificate: String?
+            get() = generateSequence(error) { it.cause }.filterIsInstance<TlsVerificationException>().firstNotNullOfOrNull { it.peerCertificateSha256 }
+    }
     /** [ConnectionSupervisor.disconnect] was called before the connection came up. */
     public data object Cancelled : ConnectResult
 }

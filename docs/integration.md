@@ -62,6 +62,8 @@ That is all the setup. `chat(...)` is a suspend function (it reads the saved log
 
 The chat runs on its own background threads. Every function can be called from the UI thread, and every list is a `StateFlow`, so there is no "collect before connecting" rule: collect whenever the screen needs it. On Android it also follows the app lifecycle and the network (closing the connection in the background so the server sends pushes, reconnecting when the app comes back) and keeps its state in Keystore-encrypted storage. The password itself is never stored.
 
+To sign in without keeping the login (a shared computer, "remember me" unticked), pass `rememberLogin = false`: the keys are not saved, and keys from an earlier sign-in are deleted.
+
 Use one `TetherChat` per account for the life of the process. Two for the same account would keep kicking each other off the server.
 
 ### 2. Show the chat list and a chat
@@ -105,11 +107,12 @@ chat.closeChat(bob)           // it left the screen
 chat.contacts.collect { render(it) }               // name, online, show (away, busy), status
 chat.contactRequests.collect { askUser(it) }       // people asking to see our presence
 
-chat.addContact(bob, name = "Bob")   // adds and asks to see Bob's presence
+chat.addContact(bob, name = "Bob", groups = setOf("Friends"))   // adds and asks to see Bob's presence
 chat.approve(carol)                  // lets Carol see ours, and asks for hers
 chat.deny(mallory)
 chat.removeContact(bob)
 chat.setPresence(Show.AWAY, "In a meeting")
+chat.setPresence(invisible = true)   // shown offline, still connected
 ```
 
 These need a connection and throw `XmppStanzaException` if the server refuses.
@@ -386,13 +389,13 @@ chat.registerPush(PushTarget(
 ))
 ```
 
-For ejabberd and Openfire, `service` is the push app server's JID and `node` and `publishOptions` are what it gave this device (see the `PushTarget` docs). Watch `chat.im.push.state`: `Unsupported` means the server has no XEP-0357 support. Tether re-registers on every new login.
+For ejabberd and Openfire, `service` is the push app server's JID and `node` and `publishOptions` are what it gave this device (see the `PushTarget` docs). Watch `chat.pushState`: `Unsupported` means the server has no XEP-0357 support. Tether re-registers on every new login.
 
 When a push arrives, call `chat.client.wake()`: it checks a live connection at once, or skips the wait before the next retry.
 
 ## Desktop notes
 
-`TetherJvm.chat` keeps its state in `~/.tether/<account>.properties`, readable by your user only (pass `store = FileKeyValueStore(path)` to choose the place). Tell the chat about window focus with `chat.client.setForeground(focused)`, so read markers only go out while the user can see the chat, and about network changes with `chat.client.networkChanged(available)` if you can detect them. Without these, the app counts as always in the foreground and always online.
+`TetherJvm.chat` keeps its state in `~/.tether/<account>.properties`, readable by your user only (pass `store = FileKeyValueStore(path)` to choose the place). It follows the network by itself, checking the network interfaces every few seconds (`JvmNetworkMonitor`). Tell the chat about window focus with `chat.client.setForeground(focused)`, so read markers only go out while the user can see the chat; without it the app counts as always in the foreground.
 
 ## Going deeper
 
@@ -443,7 +446,7 @@ val im = InstantMessaging(client)
 client.connect()
 ```
 
-Desktop apps should call `client.setForeground(...)` and `client.networkChanged(...)` themselves if they know about window focus or network changes. Without them the client behaves as a foreground app on an always-available network.
+`TetherJvm.client` follows the network by itself (`JvmNetworkMonitor`). Desktop apps should call `client.setForeground(...)` when window focus changes; without it the client behaves as a foreground app.
 
 ### Connection state
 
@@ -521,7 +524,7 @@ History needs `mod_mam` (MongooseIM, ejabberd) or the Openfire Monitoring plugin
 
 - SCRAM-SHA-256 and SCRAM-SHA-512, with channel binding when the server supports it, are the defaults.
 - PLAIN is off by default. Turn it on with `XmppConfig(sasl = SaslConfig(allowPlain = true))`. It still requires verified TLS.
-- Self-signed server certificates: pin them with `TlsConfig(pinnedCertificateSha256 = setOf("<sha-256 hex>"))`. `./gradlew :tools:probe:run` prints the fingerprint.
+- Self-signed server certificates: pin them with `TlsConfig(pinnedCertificateSha256 = setOf("<sha-256 hex>"))`. When `connect()` returns `ConnectResult.Failed`, its `untrustedCertificate` holds the fingerprint of a certificate TLS refused, to show the user ("trust this server?") and pin. `./gradlew :tools:probe:run` prints it too.
 
 ## Server checklist
 
