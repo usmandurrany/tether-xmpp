@@ -237,7 +237,7 @@ public class TetherChat(
     /** Every message, per contact, oldest first. */
     public val allMessages: StateFlow<Map<BareJid, List<Message>>> =
         // Derived without a coroutine, so `.value` is up to date the moment a call such as deleteForMe returns.
-        MappedStateFlow(threads) { all -> all.mapValues { (_, list) -> list.filterNot { it.hidden } } }
+        MappedStateFlow(threads, visibleOnly())
 
     /** When each offline contact was last online, as far as we know. */
     private val lastSeenTimes: StateFlow<Map<BareJid, Long>> =
@@ -360,7 +360,7 @@ public class TetherChat(
         }
         if (messageStore != null) {
             scope.launch {
-                runCatching { messageStore.load() }.getOrNull()?.let { merge(it) { old, new -> old.mergedWith(new) } }
+                runCatching { messageStore.load() }.getOrNull()?.let { merge(it, fromStore = true) { old, new -> old.mergedWith(new) } }
                 for (first in saves) {
                     val ops = arrayListOf(first)
                     while (true) ops += saves.tryReceive().getOrNull() ?: break
@@ -809,42 +809,43 @@ public class TetherChat(
         if (messageStore != null) saves.trySend(message to true)
     }
 
-    /** Changes one chat and saves what changed. */
+    /**
+     * Changes one chat and saves what changed. [change] must keep the
+     * messages it does not change as the same objects, as `map` and `filter`
+     * do: that is how the changed ones are found without comparing every pair.
+     */
     private fun update(peer: BareJid, change: (List<Message>) -> List<Message>) {
+        updateTracked(peer) { before ->
+            val after = change(before)
+            after to if (after === before || messageStore == null) emptyList() else changedBetween(before, after)
+        }
+    }
+
+    /** Like [update], with [change] also saying which messages to save. */
+    private fun updateTracked(peer: BareJid, change: (List<Message>) -> Pair<List<Message>, List<Message>>) {
         var changed = emptyList<Message>()
         threads.update { all ->
             val before = all[peer].orEmpty()
-            val after = change(before)
-            changed = if (after === before || messageStore == null) emptyList() else after.filter { it !in before }
+            val (after, toSave) = change(before)
+            changed = if (after === before || messageStore == null) emptyList() else toSave
             if (after === before) all else all + (peer to after)
         }
         changed.forEach { saves.trySend(it to false) }
     }
 
     /** Adds [incoming] messages, combining each with one already known through [combine]. */
-    private fun merge(incoming: List<Message>, combine: (old: Message, new: Message) -> Message) {
+    private fun merge(incoming: List<Message>, fromStore: Boolean = false, combine: (old: Message, new: Message) -> Message) {
+        val rewritten = ArrayList<Message>()
         val arrived = incoming.map { m ->
             val key = Triple(m.peer, m.outgoing, m.id)
             var deleted = false
             pendingRetractions.update { pending -> deleted = key in pending; if (deleted) pending - key else pending }
-            if (deleted) m.asDeleted() else m
+            if (deleted) m.asDeleted().also(rewritten::add) else m
         }
+        // Messages read from the store are already saved there, unless a deletion changed them on the way in.
+        val saveAdded: (Message) -> Boolean = if (fromStore) { m -> rewritten.any { it === m } } else { _ -> true }
         for ((peer, batch) in arrived.groupBy { it.peer }) {
-            update(peer) { list ->
-                var result = list
-                for (m in batch) {
-                    val index = result.indexOfFirst { it.sameAs(m) }
-                    result = if (index >= 0) {
-                        val merged = combine(result[index], m)
-                        if (merged == result[index]) result else result.toMutableList().also { it[index] = merged }
-                    } else {
-                        // Keep the list in time order; equal times keep arrival order.
-                        val at = result.indexOfLast { it.timestamp <= m.timestamp } + 1
-                        result.toMutableList().also { it.add(at, m) }
-                    }
-                }
-                result
-            }
+            updateTracked(peer) { list -> mergeInto(list, batch, saveAdded, combine) }
         }
     }
 
@@ -942,6 +943,7 @@ public class TetherChat(
     internal companion object {
         const val PAGE = 50
         const val CATCH_UP_PAGES = 10
+        const val SMALL_BATCH = 8
         const val TYPING_PAUSE_MILLIS = 5_000L
         const val TYPING_TIMEOUT_MILLIS = 30_000L
 
@@ -972,6 +974,139 @@ public class TetherChat(
                 else -> status
             }
             return if (moved == status) this else copy(status = moved, error = if (moved == MessageStatus.FAILED) error else null)
+        }
+
+        /**
+         * Every chat without its hidden messages. Only chats whose list changed
+         * since the last call are filtered again; the others keep the same list
+         * object, so collectors of one chat see nothing when another changes.
+         */
+        fun visibleOnly(): (Map<BareJid, List<Message>>) -> Map<BareJid, List<Message>> {
+            var last: Pair<Map<BareJid, List<Message>>, Map<BareJid, List<Message>>>? = null
+            return { all ->
+                val previous = last
+                val result = all.mapValues { (peer, list) ->
+                    if (previous != null && previous.first[peer] === list) {
+                        previous.second.getValue(peer)
+                    } else if (list.none { it.hidden }) {
+                        list
+                    } else {
+                        list.filterNot { it.hidden }
+                    }
+                }
+                last = all to result
+                result
+            }
+        }
+
+        /**
+         * Which messages of [after] are new or changed since [before], for a
+         * change that keeps unchanged messages as the same objects. Linear: a
+         * chat of thousands of messages must not cost thousands squared.
+         */
+        fun changedBetween(before: List<Message>, after: List<Message>): List<Message> {
+            if (before.size == after.size) {
+                // The common case: messages changed in place (a tick, read, deleted).
+                return after.filterIndexed { i, m -> m !== before[i] && m != before[i] }
+            }
+            // Messages added or removed: walk both lists, which keep the same order.
+            val changed = ArrayList<Message>()
+            var j = 0
+            for (m in after) {
+                var k = j
+                while (k < before.size && before[k] !== m) k++
+                if (k < before.size) j = k + 1 else changed += m
+            }
+            return changed
+        }
+
+        /**
+         * [batch] (one chat's messages) merged into [list]: each combined with
+         * the copy already there through [combine], or added in time order
+         * (equal times keep arrival order). Returns the new list and the
+         * messages to save. Looks each one up in a map rather than scanning the
+         * list, so a large chat or a full store load stays fast.
+         */
+        fun mergeInto(
+            list: List<Message>,
+            batch: List<Message>,
+            saveAdded: (Message) -> Boolean,
+            combine: (old: Message, new: Message) -> Message,
+        ): Pair<List<Message>, List<Message>> {
+            if (batch.size <= SMALL_BATCH) return mergeSmall(list, batch, saveAdded, combine)
+            // Slots: existing messages first, then the ones this batch adds.
+            val slots = ArrayList<Message>(list.size + batch.size).apply { addAll(list) }
+            val byId = HashMap<Pair<Boolean, String>, Int>(slots.size * 2)
+            val byServerId = HashMap<String, Int>(slots.size * 2)
+            fun index(i: Int) {
+                val m = slots[i]
+                byId.getOrPut(m.outgoing to m.id) { i }
+                m.serverId?.let { byServerId.getOrPut(it) { i } }
+            }
+            for (i in slots.indices) index(i)
+            val changed = HashSet<Int>()
+            for (m in batch) {
+                // The first in list order that matches either way, as sameAs does.
+                val a = byId[m.outgoing to m.id]
+                val b = m.serverId?.let { byServerId[it] }
+                val at = if (a == null) b else if (b == null) a else minOf(a, b)
+                if (at != null) {
+                    val merged = combine(slots[at], m)
+                    if (merged != slots[at]) {
+                        slots[at] = merged
+                        index(at)
+                        changed += at
+                    }
+                } else {
+                    slots += m
+                    index(slots.size - 1)
+                    if (saveAdded(m)) changed += slots.size - 1
+                }
+            }
+            if (changed.isEmpty() && slots.size == list.size) return list to emptyList()
+            val toSave = changed.sorted().map { slots[it] }
+            if (slots.size == list.size) return slots to toSave
+            // Insert the added ones by time: each goes after every message with the same or an earlier time.
+            val added = slots.subList(list.size, slots.size).sortedBy { it.timestamp }
+            val result = ArrayList<Message>(slots.size)
+            var i = 0
+            for (m in added) {
+                while (i < list.size && slots[i].timestamp <= m.timestamp) result += slots[i++]
+                result += m
+            }
+            while (i < list.size) result += slots[i++]
+            return result to toSave
+        }
+
+        /** [mergeInto] for a few messages, such as one that just arrived: a scan costs less than building maps. */
+        private fun mergeSmall(
+            list: List<Message>,
+            batch: List<Message>,
+            saveAdded: (Message) -> Boolean,
+            combine: (old: Message, new: Message) -> Message,
+        ): Pair<List<Message>, List<Message>> {
+            var result: MutableList<Message>? = null
+            val toSave = ArrayList<Message>()
+            for (m in batch) {
+                val current = result ?: list
+                val index = current.indexOfFirst { it.sameAs(m) }
+                if (index >= 0) {
+                    val merged = combine(current[index], m)
+                    if (merged == current[index]) continue
+                    val copy = result ?: list.toMutableList().also { result = it }
+                    toSave.removeAll { it === copy[index] }
+                    copy[index] = merged
+                    toSave += merged
+                } else {
+                    val copy = result ?: ArrayList<Message>(list.size + batch.size).apply { addAll(list) }.also { result = it }
+                    // Keep the list in time order; equal times keep arrival order. New messages are nearly always last.
+                    var at = copy.size
+                    while (at > 0 && copy[at - 1].timestamp > m.timestamp) at--
+                    copy.add(at, m)
+                    if (saveAdded(m)) toSave += m
+                }
+            }
+            return (result ?: list) to toSave
         }
 
         fun Message.sameAs(other: Message): Boolean =
