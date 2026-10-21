@@ -97,7 +97,7 @@ public class InstantMessaging(
 ) {
     public val roster: Roster = Roster(client, rosterStore)
     public val carbons: Carbons = Carbons()
-    public val presences: Presences = Presences(client, presence)
+    public val presences: Presences = Presences(client, presence, scope = client.coroutineScope)
     public val messaging: Messaging = Messaging(
         client,
         sendReceipts = features.deliveryReceipts,

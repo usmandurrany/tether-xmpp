@@ -8,6 +8,7 @@ import io.github.usmandurrany.tether.core.SessionContext
 import io.github.usmandurrany.tether.core.StanzaSender
 import io.github.usmandurrany.tether.xml.Element
 import io.github.usmandurrany.tether.xml.element
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -73,6 +74,12 @@ public class Presences(
     initial: OwnPresence = OwnPresence(),
     /** False keeps the account invisible to contacts until [set] is called. */
     private val announceOnConnect: Boolean = true,
+    /**
+     * Where [contacts] snapshots are published, so a burst of presences (one
+     * per online contact at login) costs a few copies of the map instead of
+     * one per presence. Null publishes each change at once.
+     */
+    scope: CoroutineScope? = null,
 ) : ClientExtension {
     @Volatile
     private var own = initial
@@ -80,10 +87,10 @@ public class Presences(
     @Volatile
     private var announced = announceOnConnect
 
-    private val _contacts = MutableStateFlow<Map<BareJid, List<ContactPresence>>>(emptyMap())
+    private val online = BatchedMap<BareJid, List<ContactPresence>>(scope)
 
     /** Online resources per contact. A contact missing here is offline. */
-    public val contacts: StateFlow<Map<BareJid, List<ContactPresence>>> = _contacts.asStateFlow()
+    public val contacts: StateFlow<Map<BareJid, List<ContactPresence>>> = online.flow
 
     private val _wentOffline = MutableStateFlow<Map<BareJid, Long>>(emptyMap())
 
@@ -109,7 +116,7 @@ public class Presences(
         val firstInProcess = !started
         started = true
         if (session.resumed && !firstInProcess) return // Both sides kept their presence state.
-        _contacts.value = emptyMap()
+        online.update { all -> all.isNotEmpty().also { all.clear() } }
         if (session.resumed) {
             // An app restart resumed the saved session: the server still has our presence,
             // but this process never saw the contacts'. Going unavailable and back makes the
@@ -132,17 +139,20 @@ public class Presences(
                     status = stanza.child("status", ImNs.CLIENT)?.text,
                     priority = stanza.child("priority", ImNs.CLIENT)?.text?.trim()?.toIntOrNull()?.coerceIn(-128, 127) ?: 0,
                 )
-                _contacts.update { all ->
-                    val others = all[from].orEmpty().filter { it.resource != resource }
-                    all + (from to (others + presence))
+                online.update { all ->
+                    val before = all[from].orEmpty()
+                    val after = before.filter { it.resource != resource } + presence
+                    (after != before).also { if (it) all[from] = after }
                 }
             }
             "unavailable" -> {
                 var offline = false
-                _contacts.update { all ->
-                    val left = if (resource == null) emptyList() else all[from].orEmpty().filter { it.resource != resource }
-                    offline = left.isEmpty() && all.containsKey(from)
-                    if (left.isEmpty()) all - from else all + (from to left)
+                online.update { all ->
+                    val before = all[from] ?: return@update false
+                    val left = if (resource == null) emptyList() else before.filter { it.resource != resource }
+                    offline = left.isEmpty()
+                    if (left.isEmpty()) all.remove(from) else all[from] = left
+                    true
                 }
                 // Their last device left: that is their "last seen".
                 if (offline) _wentOffline.update { it + (from to Clock.System.now().toEpochMilliseconds()) }

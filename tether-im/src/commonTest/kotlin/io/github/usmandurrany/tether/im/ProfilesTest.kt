@@ -109,6 +109,7 @@ class ProfilesTest {
         profiles.onSessionStarted(FakeSession(sender, serverFeatures = setOf(ImNs.VCARD)))
         val requests = sender.requests.size
         profiles.onStanza(xml("<presence from='romeo@example.net/o'><x xmlns='vcard-temp:x:update'><photo>ABC</photo></x></presence>"))
+        runCurrent() // hashes are published in batches
         assertEquals(mapOf(romeo to "abc"), profiles.avatarHashes.value)
         // "Not ready" changes nothing.
         profiles.onStanza(xml("<presence from='romeo@example.net/o'><x xmlns='vcard-temp:x:update'/></presence>"))
