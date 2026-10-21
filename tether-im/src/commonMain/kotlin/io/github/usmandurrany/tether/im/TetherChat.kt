@@ -243,14 +243,20 @@ public class TetherChat(
     /** The connection. Prefer [connect], [disconnect] and [close] here to calling it directly. */
     public val client: XmppClient,
     public val features: ChatFeatures = ChatFeatures(),
-    /** Keeps the contact list between runs; normally the same store the client keeps its state in. */
+    /** The store the client keeps its state and login keys in; [signOut] clears the keys. */
     private val store: KeyValueStore? = null,
     private val messageStore: MessageStore? = null,
     presence: OwnPresence = OwnPresence(),
     /** Closed with the chat, for platform wiring such as lifecycle observers. */
     private val resources: AutoCloseable? = null,
+    /**
+     * Keeps the contact list between runs. Best kept apart from [store]: a
+     * contact list of thousands is large, and the client's state is written
+     * often. Defaults to [store].
+     */
+    contactStore: KeyValueStore? = store,
 ) {
-    private val rosterStore = store?.let { StoredRoster(it, client.account) }
+    private val rosterStore = contactStore?.let { StoredRoster(it, client.account) }
 
     /** The protocol-level features, for advanced use. */
     public val im: InstantMessaging = InstantMessaging(client, rosterStore, presence, features)
@@ -389,6 +395,10 @@ public class TetherChat(
     private val storeLoaded = CompletableDeferred<Unit>()
 
     init {
+        if (store != null && contactStore != null && contactStore !== store) {
+            // Earlier versions kept the contact list next to the client's state: drop that copy.
+            scope.launch { runCatching { StoredRoster(store, client.account).clearIfPresent() } }
+        }
         client.install(SessionWatcher())
         // UNDISPATCHED: subscribed before the constructor returns, so no event is missed.
         scope.launch(start = CoroutineStart.UNDISPATCHED) { im.messaging.events.collect(::onEvent) }
@@ -1069,15 +1079,18 @@ public class TetherChat(
             return
         }
         var after: String = newest
-        repeat(CATCH_UP_PAGES) {
+        var left = features.catchUpLimit
+        while (left > 0) {
+            val max = minOf(PAGE, left)
             val page = try {
-                im.history.fetch(after = after, max = PAGE)
+                im.history.fetch(after = after, max = max)
             } catch (e: XmppStanzaException) {
                 // The archive no longer has our newest message: start from its newest page.
                 importPage(im.history.fetch(max = PAGE), unread = false)
                 return
             }
             importPage(page, unread = true)
+            left -= max
             after = page.last ?: return
             if (page.complete) return
         }
@@ -1130,14 +1143,13 @@ public class TetherChat(
         override suspend fun onSessionStarted(session: SessionContext) {
             val firstInProcess = first
             first = false
-            if (!features.history || (session.resumed && !firstInProcess)) return
+            if (!features.history || features.catchUpLimit <= 0 || (session.resumed && !firstInProcess)) return
             scope.launch { runCatching { catchUp() } }
         }
     }
 
     internal companion object {
         const val PAGE = 50
-        const val CATCH_UP_PAGES = 10
         const val SMALL_BATCH = 8
 
         /** Messages per chat read from a paged store at startup, and kept when a chat closes. */

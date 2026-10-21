@@ -58,7 +58,13 @@ public class AndroidSecureStore(context: Context, name: String = "tether") : Key
         }
     }
 
-    private fun secretKey(): SecretKey {
+    /** Loaded once: opening the Keystore on every read and write is slow. */
+    @Volatile
+    private var cachedKey: SecretKey? = null
+
+    private fun secretKey(): SecretKey = cachedKey ?: loadKey().also { cachedKey = it }
+
+    private fun loadKey(): SecretKey {
         val keyStore = KeyStore.getInstance(PROVIDER).apply { load(null) }
         (keyStore.getKey(alias, null) as? SecretKey)?.let { return it }
         val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, PROVIDER)

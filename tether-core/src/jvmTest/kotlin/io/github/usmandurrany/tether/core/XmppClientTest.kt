@@ -236,6 +236,40 @@ class XmppClientTest {
     }
 
     @Test
+    fun inTheForegroundStateIsWrittenOnlyWhenItMatters() = runBlocking<Unit> {
+        val fake = FakeXmppServer(streamManagement = true)
+        var writes = 0
+        val store = object : KeyValueStore by MemoryKeyValueStore() {
+            override suspend fun put(key: String, value: String?) { if (key.startsWith("tether.state.")) writes++ }
+        }
+        val client = client(fake, store = store)
+        withTimeout(10_000) { client.connect() }
+        delay(800)
+        val afterConnect = writes
+        assertTrue(afterConnect >= 1, "a new session is written")
+
+        // Typing, receipts and acks while the app is in use stay in memory.
+        repeat(20) {
+            client.send(element("message", Ns.CLIENT) {
+                attribute("to", "romeo@localhost")
+                element("composing", "http://jabber.org/protocol/chatstates")
+            })
+        }
+        delay(800)
+        assertEquals(afterConnect, writes, "no writes for stanzas without a body")
+
+        // A message the user wrote is written, so a crash before the server confirms it loses nothing.
+        client.send(message("hello", id = "m1"))
+        delay(800)
+        assertEquals(afterConnect + 1, writes)
+
+        // Going to the background writes at once.
+        client.setForeground(false)
+        delay(200)
+        assertEquals(afterConnect + 2, writes)
+    }
+
+    @Test
     fun theOutboxSurvivesARestart() = runBlocking<Unit> {
         val fake = FakeXmppServer(streamManagement = true)
         val store = MemoryKeyValueStore()
