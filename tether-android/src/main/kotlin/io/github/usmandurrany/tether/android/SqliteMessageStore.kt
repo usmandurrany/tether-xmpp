@@ -7,6 +7,7 @@ import android.database.sqlite.SQLiteOpenHelper
 import io.github.usmandurrany.tether.core.BareJid
 import io.github.usmandurrany.tether.im.Message
 import io.github.usmandurrany.tether.im.MessageCodec
+import io.github.usmandurrany.tether.im.MessagePosition
 import io.github.usmandurrany.tether.im.MessageStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -15,7 +16,10 @@ import kotlinx.coroutines.withContext
  * A [MessageStore] in an SQLite database in the app's private storage: the
  * default of [TetherAndroid.chat]. One database per account, with one row per
  * message: the key columns, the timestamp, and the whole message in one text
- * column ([MessageCodec]), so new fields never need a migration.
+ * column ([MessageCodec]), so new fields never need a migration. It is
+ * [paged][MessageStore.paged]: [TetherChat][io.github.usmandurrany.tether.im.TetherChat]
+ * reads each chat's newest messages at startup and older ones a page at a
+ * time, through the index on peer and timestamp.
  *
  * Like any app database it is readable only by the app, and not encrypted
  * beyond the device's own storage encryption.
@@ -25,6 +29,26 @@ public class SqliteMessageStore(context: Context, account: BareJid) : MessageSto
 
     override suspend fun load(): List<Message> = io {
         helper.readableDatabase.query(TABLE, arrayOf(DATA), null, null, null, null, null).use { c ->
+            buildList { while (c.moveToNext()) MessageCodec.decode(c.getString(0))?.let(::add) }
+        }
+    }
+
+    override val paged: Boolean get() = true
+
+    override suspend fun chats(): Set<BareJid> = io {
+        helper.readableDatabase.query(true, TABLE, arrayOf(PEER), null, null, null, null, null, null).use { c ->
+            buildSet { while (c.moveToNext()) runCatching { BareJid.parse(c.getString(0)) }.getOrNull()?.let(::add) }
+        }
+    }
+
+    override suspend fun loadBefore(peer: BareJid, before: MessagePosition?, limit: Int): List<Message> = io {
+        val (where, args) = if (before == null) {
+            "$PEER = ?" to arrayOf(peer.toString())
+        } else {
+            val time = before.timestamp.toString()
+            "$PEER = ? AND ($TIMESTAMP < ? OR ($TIMESTAMP = ? AND $KEY < ?))" to arrayOf(peer.toString(), time, time, before.key)
+        }
+        helper.readableDatabase.query(TABLE, arrayOf(DATA), where, args, null, null, "$TIMESTAMP DESC, $KEY DESC", limit.toString()).use { c ->
             buildList { while (c.moveToNext()) MessageCodec.decode(c.getString(0))?.let(::add) }
         }
     }

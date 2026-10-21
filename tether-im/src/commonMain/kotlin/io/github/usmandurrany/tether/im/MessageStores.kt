@@ -64,7 +64,9 @@ public object MessageCodec {
 
 /**
  * Checks that a [MessageStore] of your own behaves the way [TetherChat]
- * needs, so ticks, read state, deletions and custom data survive restarts.
+ * needs, so ticks, read state, deletions and custom data survive restarts,
+ * and, for a [paged][MessageStore.paged] store, that paging back through a
+ * chat gives every message once, in order.
  * Run it once from a test against an empty store:
  *
  * ```
@@ -102,6 +104,38 @@ public object MessageStoreCheck {
 
         store.clear()
         check(store.load().isEmpty()) { "clear() left messages behind" }
+        if (store.paged) checkPaging(store, bob, carol)
+    }
+
+    private suspend fun checkPaging(store: MessageStore, bob: BareJid, carol: BareJid) {
+        // Equal times are common: archives often stamp to the second.
+        val chat = listOf(10L, 20, 20, 20, 30, 40, 40).mapIndexed { i, t ->
+            Message("p$i", bob, outgoing = i % 2 == 0, body = "page $i", timestamp = t, status = MessageStatus.READ)
+        }
+        store.save(chat + Message("c", carol, outgoing = false, body = "carol", timestamp = 25, status = MessageStatus.UNREAD))
+        check(store.chats() == setOf(bob, carol)) { "chats() should be [$bob, $carol], was ${store.chats()}" }
+
+        val walked = ArrayList<Message>()
+        var before: MessagePosition? = null
+        while (true) {
+            val page = store.loadBefore(bob, before, 2)
+            check(page.size <= 2) { "loadBefore returned ${page.size} messages for a limit of 2" }
+            if (page.isEmpty()) break
+            walked += page
+            before = MessagePosition.of(page.last())
+        }
+        val wanted = chat.sortedByDescending(MessagePosition::of)
+        check(walked == wanted) {
+            "Paging back through a chat with loadBefore(limit = 2) gave ${walked.map { it.id }}, expected ${wanted.map { it.id }} " +
+                "(newest first, by timestamp and then MessageCodec.keyOf, nothing repeated or skipped)"
+        }
+        check(store.loadBefore(bob, MessagePosition(20, ""), 10).map { it.id } == listOf("p0")) {
+            "loadBefore(MessagePosition(20, \"\")) should return only what is older than time 20"
+        }
+        store.delete(chat.take(1))
+        check(store.loadBefore(bob, null, 100).size == chat.size - 1) { "A deleted message still comes back from loadBefore" }
+        store.clear()
+        check(store.chats().isEmpty()) { "clear() left chats behind" }
     }
 
     private suspend fun expect(store: MessageStore, wanted: List<Message>, what: String) {

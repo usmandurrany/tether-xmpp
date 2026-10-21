@@ -417,6 +417,81 @@ class TetherChatTest {
         override suspend fun clear() { rows.clear() }
     }
 
+    /** A store that reads a chat a page at a time, as the built-in ones do. */
+    private class PagedStore : MessageStore {
+        val rows = LinkedHashMap<String, Message>()
+        var loads = 0
+        override val paged get() = true
+        override suspend fun load() = rows.values.toList().also { loads++ }
+        override suspend fun save(messages: List<Message>) { messages.forEach { rows[MessageCodec.keyOf(it)] = it } }
+        override suspend fun delete(messages: List<Message>) { messages.forEach { rows.remove(MessageCodec.keyOf(it)) } }
+        override suspend fun clear() { rows.clear() }
+        override suspend fun chats() = rows.values.mapTo(HashSet()) { it.peer }
+        override suspend fun loadBefore(peer: BareJid, before: MessagePosition?, limit: Int) =
+            rows.values.filter { it.peer == peer && (before == null || MessagePosition.of(it) < before) }
+                .sortedByDescending(MessagePosition::of).take(limit)
+    }
+
+    private fun TestScope.offlineClient(): XmppClient = XmppClient(
+        StreamNegotiator(
+            XmppConfig(BareJid.parse("juliet@example.com"), password = "x"),
+            object : XmppTransportFactory {
+                override suspend fun connect(endpoint: Endpoint, serverName: String): XmppTransport = error("offline test")
+            },
+            EndpointResolver({ emptyList() }),
+        ),
+        backgroundScope,
+    )
+
+    @Test
+    fun aPagedStoreKeepsOnlyTheNewestInMemoryAndPagesBackOffline() = runTest {
+        val store = PagedStore()
+        val mercutio = BareJid.parse("mercutio@example.net")
+        // A long chat: 500 read messages, then 120 unread; and a short one.
+        val long = List(620) { i ->
+            Message("r$i", romeo, outgoing = i % 3 == 0 && i < 500, body = "m$i", timestamp = 1_000L + i,
+                status = if (i < 500) MessageStatus.READ else MessageStatus.UNREAD)
+        }
+        store.save(long + Message("x", mercutio, outgoing = false, body = "hey", timestamp = 5, status = MessageStatus.READ))
+
+        val chat = TetherChat(offlineClient(), ChatFeatures(history = false), messageStore = store)
+        runCurrent()
+        assertEquals(0, store.loads, "a paged store is never read whole")
+        val shown = chat.messages(romeo).value
+        // The newest 100, extended back past every unread message.
+        assertTrue(shown.size in 120..170, "kept ${shown.size}")
+        assertEquals(long.takeLast(shown.size), shown)
+        assertEquals(120, chat.conversations.value.first { it.peer == romeo }.unreadCount)
+        assertEquals(1, chat.messages(mercutio).value.size)
+
+        // Scrolling back reads the store a page at a time, without a connection.
+        while (chat.loadOlder(romeo)) runCurrent()
+        assertEquals(long, chat.messages(romeo).value)
+        assertFalse(chat.loadOlder(romeo))
+
+        // Leaving the chat drops the older pages again; they come back from the store.
+        chat.openChat(romeo)
+        runCurrent()
+        chat.closeChat(romeo)
+        runCurrent()
+        assertTrue(chat.messages(romeo).value.size < 200, "kept ${chat.messages(romeo).value.size} after closing")
+        assertEquals(0, chat.conversations.value.first { it.peer == romeo }.unreadCount, "read on screen")
+        while (chat.loadOlder(romeo)) runCurrent()
+        assertEquals(long.map { it.id }, chat.messages(romeo).value.map { it.id })
+    }
+
+    @Test
+    fun aStoreLoadDoesNotWriteEverythingBack() = runTest {
+        var saved = 0
+        val inner = PagedStore().apply { save(List(10) { Message("m$it", romeo, false, "b", it.toLong(), MessageStatus.READ) }) }
+        val wrapped = object : MessageStore by inner {
+            override suspend fun save(messages: List<Message>) { saved += messages.size; inner.save(messages) }
+        }
+        TetherChat(offlineClient(), ChatFeatures(history = false), messageStore = wrapped)
+        runCurrent()
+        assertEquals(0, saved)
+    }
+
     @Test
     fun theStoreKeepsTicksAndLoadsThemBack() = runTest {
         val store = MemoryStore()

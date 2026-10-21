@@ -98,7 +98,9 @@ chat.openChat(bob)            // the chat is on screen
 chat.closeChat(bob)           // it left the screen
 ```
 
-`openChat` is how read receipts work: while a chat is open and the app is in the foreground, its messages are marked read and the contact is told (only for messages that asked for it, as XEP-0333 requires). The first time a chat opens, its newest page of history loads. Call `chat.loadOlder(bob)` when the user scrolls to the top; it returns false when there is nothing older.
+`openChat` is how read receipts work: while a chat is open and the app is in the foreground, its messages are marked read and the contact is told (only for messages that asked for it, as XEP-0333 requires). The first time a chat opens, its newest page of history loads. Call `chat.loadOlder(bob)` when the user scrolls near the top: it reads the next 50 older messages from the device's store (instantly, also offline), and from the server's archive once the store has nothing older. It returns false when there is nothing older.
+
+`messages(bob)` doesn't hold the whole history. It starts with the chat's newest 100 messages, plus any older unread ones, and grows as `loadOlder` brings in more. When the chat closes (`closeChat`), it goes back to the newest 100. So a chat with years of history costs no more memory or startup time than a new one.
 
 `typing` sends "typing" once, then "paused" after five idle seconds; sending the message ends it. A contact who stops typing without saying so stops showing as typing after 30 seconds.
 
@@ -159,20 +161,25 @@ Messages are kept on the device by default, so ticks, read state, deletions and 
 - **Android:** `TetherAndroid.chat` uses `SqliteMessageStore`, an SQLite database in the app's private storage, one per account.
 - **Desktop:** `TetherJvm.chat` uses `FileMessageStore`, at `~/.tether/<account>.messages`, readable by the user only.
 
-There's nothing to set up. `signOut()` empties the store. Pass `messageStore = null` to keep messages in memory only; the SDK then rebuilds recent chats from the server archive after a restart.
+There's nothing to set up. `signOut()` empties the store. Both built-in stores are *paged*: the SDK reads each chat's newest messages at startup, and older ones a page at a time as the user scrolls back. Pass `messageStore = null` to keep messages in memory only; the SDK then rebuilds recent chats from the server archive after a restart.
 
 After each new sign-in the SDK also catches up from the archive: messages sent and received on other devices while this one was offline appear, and ones read elsewhere are marked read.
 
 ### Using your own database
 
-To keep messages in Room, SQLDelight, Realm or your own backend, implement `MessageStore` and pass it as `messageStore`. The SDK still does all the logic (status, receipts, read markers, deletions, de-duplication); a store only keeps rows. It has four functions:
+To keep messages in Room, SQLDelight, Realm or your own backend, implement `MessageStore` and pass it as `messageStore`. The SDK still does all the logic (status, receipts, read markers, deletions, de-duplication); a store only keeps rows. It has four required functions, and three more for paging:
 
 | Function | What it must do |
 | --- | --- |
-| `load()` | Return every saved message. Called once, when the chat is created. |
+| `load()` | Return every saved message. Called once, when the chat is created, unless the store is paged. |
 | `save(messages)` | Insert each message, or **replace** the one with the same peer, direction and id. Called for every new or changed message: a status change is a save. |
 | `delete(messages)` | Remove these messages (same key). |
 | `clear()` | Remove everything, on sign-out. |
+| `paged` | Return `true` once you implement the next two. Then `load()` is never called at startup. |
+| `chats()` | Every peer with at least one saved message. |
+| `loadBefore(peer, before, limit)` | Up to `limit` of that peer's messages older than `before`, **newest first**; the newest when `before` is null. "Older" means by timestamp, then by `MessageCodec.keyOf` for equal times (see the query below). |
+
+Paging is optional, but without it every message is read into memory at startup. That is fine for a few thousand messages, and slow for a year of busy chats.
 
 The easy way to keep every field right is to store each message whole with `MessageCodec`, keyed by `MessageCodec.keyOf(message)`. New fields in later SDK versions then need no migration. With Room:
 
@@ -188,6 +195,14 @@ data class MessageRow(
 @Dao
 interface MessageDao {
     @Query("SELECT * FROM messages") suspend fun all(): List<MessageRow>
+    @Query("SELECT DISTINCT peer FROM messages") suspend fun peers(): List<String>
+    @Query("SELECT * FROM messages WHERE peer = :peer ORDER BY timestamp DESC, messageKey DESC LIMIT :limit")
+    suspend fun newest(peer: String, limit: Int): List<MessageRow>
+    @Query(
+        "SELECT * FROM messages WHERE peer = :peer AND (timestamp < :time OR (timestamp = :time AND messageKey < :key)) " +
+            "ORDER BY timestamp DESC, messageKey DESC LIMIT :limit",
+    )
+    suspend fun before(peer: String, time: Long, key: String, limit: Int): List<MessageRow>
     @Upsert suspend fun upsert(rows: List<MessageRow>)
     @Query("DELETE FROM messages WHERE messageKey IN (:keys)") suspend fun delete(keys: List<String>)
     @Query("DELETE FROM messages") suspend fun clear()
@@ -203,6 +218,16 @@ class RoomMessageStore(private val dao: MessageDao) : MessageStore {
     override suspend fun delete(messages: List<Message>) = dao.delete(messages.map(MessageCodec::keyOf))
 
     override suspend fun clear() = dao.clear()
+
+    override val paged = true
+
+    override suspend fun chats() = dao.peers().map(BareJid::parse).toSet()
+
+    override suspend fun loadBefore(peer: BareJid, before: MessagePosition?, limit: Int): List<Message> {
+        val rows = if (before == null) dao.newest(peer.toString(), limit)
+        else dao.before(peer.toString(), before.timestamp, before.key, limit)
+        return rows.mapNotNull { MessageCodec.decode(it.data) }
+    }
 }
 
 val chat = TetherAndroid.chat(context, jid, password, messageStore = RoomMessageStore(db.messageDao()))
@@ -219,7 +244,7 @@ If you'd rather map each field to its own column, keep all of them. Dropping one
 - **`hidden`** keeps a message deleted for you hidden. These rows are never shown, but without them the archive brings the message back.
 - **`payloads`** is the custom data. Keep it in one text column with `Payloads.toXml(message.payloads)` and read it back with `Payloads.fromXml(text)`.
 
-Then check your store from a unit test. `MessageStoreCheck` saves, replaces, hides, deletes and clears test messages, and throws with what came back wrong:
+Then check your store from a unit test. `MessageStoreCheck` saves, replaces, hides, deletes and clears test messages, pages back through a chat when the store is paged, and throws with what came back wrong:
 
 ```kotlin
 @Test
