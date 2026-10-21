@@ -1,13 +1,19 @@
 package io.github.usmandurrany.tether.transport
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.KeyStore
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import java.security.MessageDigest
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
@@ -29,15 +35,20 @@ public class JvmSocketTransportFactory(
     private val config: TlsConfig = TlsConfig(),
     private val tlsProvider: TlsProvider = PlatformTlsProvider,
 ) : XmppTransportFactory {
-    override suspend fun connect(endpoint: Endpoint, serverName: String): XmppTransport = withContext(Dispatchers.IO) {
-        val socket = connectAny(endpoint)
-        try {
-            val transport = JvmSocketTransport(endpoint, socket, config, tlsProvider)
-            if (endpoint.directTls) transport.upgrade(serverName)
-            transport
-        } catch (t: Throwable) {
-            runCatching { socket.close() }
-            throw t
+    override suspend fun connect(endpoint: Endpoint, serverName: String): XmppTransport {
+        // Closing the socket is the only way to stop a blocking connect or handshake.
+        val current = AtomicReference<Socket?>(null)
+        val cancelled = AtomicBoolean(false)
+        return blocking(onCancel = { cancelled.set(true); runCatching { current.get()?.close() } }) {
+            val socket = connectAny(endpoint) { current.set(it); if (cancelled.get()) it.close() }
+            try {
+                val transport = JvmSocketTransport(endpoint, socket, config, tlsProvider)
+                if (endpoint.directTls) transport.upgrade(serverName)
+                transport
+            } catch (t: Throwable) {
+                runCatching { socket.close() }
+                throw t
+            }
         }
     }
 
@@ -45,12 +56,13 @@ public class JvmSocketTransportFactory(
      * Tries every address of the host in turn, so a broken IPv6 route (common on
      * mobile networks) falls through to IPv4 instead of failing the endpoint.
      */
-    private fun connectAny(endpoint: Endpoint): Socket {
+    private fun connectAny(endpoint: Endpoint, created: (Socket) -> Unit): Socket {
         val addresses = InetAddress.getAllByName(endpoint.host).take(MAX_ADDRESSES)
         var last: Exception? = null
         for (address in addresses) {
             val socket = Socket()
             try {
+                created(socket)
                 socket.tcpNoDelay = true
                 socket.keepAlive = true
                 socket.connect(InetSocketAddress(address, endpoint.port), config.connectTimeoutMillis.toInt())
@@ -85,14 +97,19 @@ internal class JvmSocketTransport(
     override var channelBindings: List<TlsChannelBinding> = emptyList()
         private set
 
-    override suspend fun read(buffer: ByteArray): Int = withContext(Dispatchers.IO) { input.read(buffer) }
+    // Reads and the handshake block and ignore coroutine cancellation, so cancelling them
+    // closes the socket: a cancelled connection attempt then ends at once instead of
+    // holding up the next one. Only the connection's own reader reads, so nothing else
+    // can close it this way. Writes come from callers of send(), whose cancellation
+    // must not end the connection, so they keep the plain dispatch.
+    override suspend fun read(buffer: ByteArray): Int = blocking(::close) { input.read(buffer) }
 
     override suspend fun write(data: ByteArray): Unit = withContext(Dispatchers.IO) {
         output.write(data)
         output.flush()
     }
 
-    override suspend fun startTls(serverName: String): Unit = withContext(Dispatchers.IO) { upgrade(serverName) }
+    override suspend fun startTls(serverName: String): Unit = blocking(::close) { upgrade(serverName) }
 
     override fun close() {
         runCatching { socket.close() }
@@ -113,10 +130,18 @@ internal class JvmSocketTransport(
             if (config.pinnedCertificateSha256.isEmpty()) endpointIdentificationAlgorithm = "HTTPS"
         }
         try {
+            // A handshake that stalls (a link that died without closing) would otherwise wait forever.
+            ssl.soTimeout = config.handshakeTimeoutMillis.toInt()
             ssl.startHandshake()
+            ssl.soTimeout = 0 // Liveness of an open stream is the supervisor's probe.
         } catch (e: Exception) {
             runCatching { ssl.close() }
-            throw TlsVerificationException("TLS handshake with $serverName failed: ${e.message}", trust.seenFingerprint, e)
+            // Only a refused certificate is final. A reset, timeout or closed link mid-handshake
+            // is a network problem, and retrying will fix it.
+            if (trust.rejected || generateSequence<Throwable>(e) { it.cause }.any { it is CertificateException }) {
+                throw TlsVerificationException("TLS handshake with $serverName failed: ${e.message}", trust.seenFingerprint, e)
+            }
+            throw IOException("TLS handshake with $serverName failed: ${e.message}", e)
         }
         val leaf = ssl.session.peerCertificates.first() as X509Certificate
         if (config.pinnedCertificateSha256.isEmpty() && !HostnameCheck.matches(leaf, serverName)) {
@@ -159,7 +184,20 @@ private class RecordingTrustManager(private val pins: Set<String>) : X509TrustMa
     @Volatile
     var seenFingerprint: String? = null
 
+    /** The certificate was checked and refused (as opposed to the handshake failing for another reason). */
+    @Volatile
+    var rejected = false
+
     override fun checkServerTrusted(chain: Array<out X509Certificate>, authType: String) {
+        try {
+            check(chain, authType)
+        } catch (e: CertificateException) {
+            rejected = true
+            throw e
+        }
+    }
+
+    private fun check(chain: Array<out X509Certificate>, authType: String) {
         if (chain.isEmpty()) throw CertificateException("Server sent no certificate")
         val fingerprint = sha256Hex(chain[0].encoded)
         seenFingerprint = fingerprint
@@ -176,6 +214,21 @@ private class RecordingTrustManager(private val pins: Set<String>) : X509TrustMa
 
     override fun getAcceptedIssuers(): Array<X509Certificate> =
         if (pins.isNotEmpty()) emptyArray() else platform.acceptedIssuers
+}
+
+/**
+ * Runs blocking socket work on [Dispatchers.IO]. If the caller is cancelled,
+ * [onCancel] closes the socket, which makes the blocked call throw, so
+ * cancellation takes effect at once.
+ */
+internal suspend fun <T> blocking(onCancel: () -> Unit, block: () -> T): T = coroutineScope {
+    val work = async(Dispatchers.IO) { block() }
+    try {
+        work.await()
+    } catch (e: CancellationException) {
+        onCancel()
+        throw e
+    }
 }
 
 /**

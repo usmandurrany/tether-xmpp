@@ -73,6 +73,8 @@ public data class TlsConfig(
     /** Lowercase hex SHA-256 fingerprints of acceptable leaf certificates (DER). */
     public val pinnedCertificateSha256: Set<String> = emptySet(),
     public val connectTimeoutMillis: Long = 10_000,
+    /** Longest wait for the server during the TLS handshake before the attempt fails and is retried. */
+    public val handshakeTimeoutMillis: Long = 15_000,
 ) {
     init {
         require(pinnedCertificateSha256.all { it.matches(Regex("[0-9a-f]{64}")) }) {

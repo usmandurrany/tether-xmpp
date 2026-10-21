@@ -335,6 +335,45 @@ class ConnectionSupervisorTest {
     }
 
     @Test
+    fun aDifferentNetworkAfterALossReconnectsWithoutWaitingForTheProbe() = runTest {
+        val server = FakeServer(backgroundScope)
+        val sup = supervisor(server)
+        sup.networkChanged(true, "wifi-1")
+        sup.connect()
+        // The network goes away; the socket on it can no longer answer.
+        server.probeAnswers = { false }
+        server.probeDelayMillis = 60_000
+        sup.networkChanged(false)
+        settle(2_000)
+        assertIs<ConnectionState.Online>(sup.state.value, "still checking, as for a flaky callback")
+
+        // Mobile data comes up 2 s later: reconnect at once, not after the 10 s probe timeout.
+        server.probeAnswers = { true }
+        server.probeDelayMillis = 50
+        val back = testScheduler.currentTime
+        sup.networkChanged(true, "cell-1")
+        while (sup.state.value !is ConnectionState.Online || server.sessions.size < 2) settle(50)
+        assertTrue(testScheduler.currentTime - back < 1_000, "took ${testScheduler.currentTime - back} ms")
+        assertTrue(server.sessions[0].closed)
+        assertEquals(1, server.live.size)
+    }
+
+    @Test
+    fun theSameNetworkBackAfterALossKeepsTheSession() = runTest {
+        val server = FakeServer(backgroundScope)
+        server.probeDelayMillis = 3_000
+        val sup = supervisor(server)
+        sup.networkChanged(true, "wifi-1")
+        sup.connect()
+        sup.networkChanged(false)
+        settle(500)
+        sup.networkChanged(true, "wifi-1") // a blip in the OS callbacks, same network
+        settle()
+        assertIs<ConnectionState.Online>(sup.state.value)
+        assertEquals(1, server.opensStarted)
+    }
+
+    @Test
     fun wakeSkipsTheBackoffWait() = runTest {
         val server = FakeServer(backgroundScope)
         var fail = true
