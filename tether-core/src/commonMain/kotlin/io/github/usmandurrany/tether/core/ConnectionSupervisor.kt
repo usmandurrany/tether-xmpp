@@ -265,6 +265,8 @@ public class ConnectionSupervisor(
     private var networkId: String? = null
     private var networkKind: String? = null
     private var attemptNetworkId: String? = null
+    /** The network the live session was opened on. */
+    private var sessionNetworkId: String? = null
     private var attemptJob: Job? = null
     /** Cancelled attempts that have not finished yet (a blocking connect may ignore cancellation). */
     private val draining = ArrayList<Job>()
@@ -615,7 +617,18 @@ public class ConnectionSupervisor(
         when (_state.value) {
             // Never close a live session on suspicion; check it. A failed probe
             // then waits for the network or reconnects.
-            is ConnectionState.Online -> if (!available || !wasAvailable || id != previousId) probe()
+            is ConnectionState.Online -> when {
+                // The OS reported no network while the probe from that loss is still
+                // unanswered, and now a different network is here: the session's own
+                // network is gone (Android gives a returning network a new id too), so
+                // its socket cannot answer. Reconnect now instead of waiting out the probe.
+                available && !wasAvailable && probeJob != null && id != sessionNetworkId -> {
+                    dropSession()
+                    failures = 0
+                    if (pausedByBackground) pauseAfterLoss() else startAttempt()
+                }
+                !available || !wasAvailable || id != previousId -> probe()
+            }
             is ConnectionState.Connecting -> when {
                 !available -> {
                     cancelAttempt()
@@ -679,6 +692,7 @@ public class ConnectionSupervisor(
         val opened = done.session
         if (opened != null) {
             session = opened
+            sessionNetworkId = attemptNetworkId
             onlineSince = clock()
             set(ConnectionState.Online(opened.jid))
             completeWaiters(ConnectResult.Connected(opened.jid))
