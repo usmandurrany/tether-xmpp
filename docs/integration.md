@@ -413,6 +413,8 @@ The deadline counts from the push, and more pushes during the wake do not extend
 
 `TetherJvm.chat` keeps its state in `~/.tether/<account>.properties`, readable by your user only (pass `store = FileKeyValueStore(path)` to choose the place). It follows the network by itself, checking the network interfaces every few seconds (`JvmNetworkMonitor`). Tell the chat about window focus with `chat.client.setForeground(focused)`, so read markers only go out while the user can see the chat; without it the app counts as always in the foreground.
 
+If you report window focus, also create the chat with `policy = ClientPolicy(reconnect = ReconnectPolicy(backgroundMode = BackgroundMode.STAY_CONNECTED))`. With the default (`CLOSE`, meant for phones), `setForeground(false)` closes the connection five seconds after the window loses focus.
+
 ## Going deeper
 
 `chat.im` gives the protocol-level features `TetherChat` is built on, and `chat.client` the connection itself. You can also build them yourself, as below, and handle the events directly. Install everything before `connect()`.
