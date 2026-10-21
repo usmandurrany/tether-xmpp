@@ -110,8 +110,15 @@ public data class Conversation(
     val online: Boolean,
     /** When the contact was last online, in milliseconds since the epoch; null while online or when unknown. */
     val lastSeen: Long? = null,
-    /** Their profile picture, once fetched. */
+    /** Their profile picture, once fetched with [TetherChat.profile] or by opening the chat. */
     val avatar: Avatar? = null,
+    /**
+     * The picture their presence advertises: a SHA-1 hex that changes when
+     * they change it, "" for no picture, null when unknown. The SDK does not
+     * download pictures on its own: cache them by this hash and fetch with
+     * [TetherChat.profile] (`refresh = true` when the hash no longer matches).
+     */
+    val avatarHash: String? = null,
 )
 
 /** One entry of the contact list, with what we know of their presence. */
@@ -130,8 +137,15 @@ public data class Contact(
     val groups: Set<String>,
     /** When they were last online, in milliseconds since the epoch; null while online or when unknown. */
     val lastSeen: Long? = null,
-    /** Their profile picture, once fetched. */
+    /** Their profile picture, once fetched with [TetherChat.profile] or by opening the chat. */
     val avatar: Avatar? = null,
+    /**
+     * The picture their presence advertises: a SHA-1 hex that changes when
+     * they change it, "" for no picture, null when unknown. The SDK does not
+     * download pictures on its own: cache them by this hash and fetch with
+     * [TetherChat.profile] (`refresh = true` when the hash no longer matches).
+     */
+    val avatarHash: String? = null,
 )
 
 /**
@@ -297,10 +311,12 @@ public class TetherChat(
             (asked.keys + watched.keys).associateWith { maxOf(asked[it] ?: 0, watched[it] ?: 0) }
         }.stateIn(scope, SharingStarted.Eagerly, emptyMap())
 
-    /** Roster entries and fetched profiles, which together give names and pictures. */
-    private val people: StateFlow<Pair<Map<BareJid, RosterItem>, Map<BareJid, Profile>>> =
-        combine(im.roster.items, im.profiles.known) { roster, profiles -> roster to profiles }
-            .stateIn(scope, SharingStarted.Eagerly, im.roster.items.value to im.profiles.known.value)
+    /** Roster entries, fetched profiles and advertised picture hashes, which together give names and pictures. */
+    private val people: StateFlow<People> =
+        combine(im.roster.items, im.profiles.known, im.profiles.avatarHashes, ::People)
+            .stateIn(scope, SharingStarted.Eagerly, People(im.roster.items.value, im.profiles.known.value, im.profiles.avatarHashes.value))
+
+    private class People(val roster: Map<BareJid, RosterItem>, val profiles: Map<BareJid, Profile>, val hashes: Map<BareJid, String>)
 
     /** Contacts typing right now. */
     public val typingContacts: StateFlow<Set<BareJid>> =
@@ -308,7 +324,9 @@ public class TetherChat(
 
     /** The chat list, most recent first. */
     public val conversations: StateFlow<List<Conversation>> =
-        combine(allMessages, typingContacts, people, im.presences.contacts, lastSeenTimes) { all, typing, (roster, profiles), online, seen ->
+        combine(allMessages, typingContacts, people, im.presences.contacts, lastSeenTimes) { all, typing, people, online, seen ->
+            val roster = people.roster
+            val profiles = people.profiles
             all.filterValues { it.isNotEmpty() }.map { (peer, messages) ->
                 Conversation(
                     peer = peer,
@@ -319,6 +337,7 @@ public class TetherChat(
                     online = !online[peer].isNullOrEmpty(),
                     lastSeen = if (features.lastSeen && online[peer].isNullOrEmpty()) seen[peer] else null,
                     avatar = profiles[peer]?.avatar,
+                    avatarHash = people.hashes[peer],
                 )
             }.sortedByDescending { it.lastMessage?.timestamp ?: 0 }
         }.stateIn(scope, SharingStarted.Eagerly, emptyList())
@@ -330,8 +349,9 @@ public class TetherChat(
 
     /** The contact list, sorted by name. Empty when [ChatFeatures.contacts] is off. */
     public val contacts: StateFlow<List<Contact>> =
-        combine(people, im.presences.contacts, lastSeenTimes) { (roster, profiles), online, seen ->
-            roster.values.map { item ->
+        combine(people, im.presences.contacts, lastSeenTimes) { people, online, seen ->
+            val profiles = people.profiles
+            people.roster.values.map { item ->
                 val best = online[item.jid].orEmpty().maxByOrNull { it.priority }
                 Contact(
                     jid = item.jid,
@@ -344,6 +364,7 @@ public class TetherChat(
                     groups = item.groups,
                     lastSeen = if (features.lastSeen && best == null) seen[item.jid] else null,
                     avatar = profiles[item.jid]?.avatar,
+                    avatarHash = people.hashes[item.jid],
                 )
             }.sortedBy { it.name.lowercase() }
         }.stateIn(scope, SharingStarted.Eagerly, emptyList())
@@ -452,12 +473,14 @@ public class TetherChat(
             storeLoaded.complete(Unit)
         }
         if (features.profiles) {
-            // A contact's presence says when their picture changed: fetch the profile then.
+            // Profiles are fetched for chats on screen only (and on request, with [profile]):
+            // fetching every contact's on each login costs a request and a picture each.
+            // An open chat whose contact changed their picture gets the new one.
             scope.launch {
-                im.profiles.avatarHashes.collect { hashes ->
+                combine(im.profiles.avatarHashes, openChats) { hashes, open ->
                     val known = im.profiles.known.value
-                    hashes.forEach { (jid, hash) -> if (known[jid]?.avatar?.hash.orEmpty() != hash || jid !in known) queueProfile(jid) }
-                }
+                    open.filter { jid -> hashes[jid]?.let { hash -> known[jid]?.avatar?.hash.orEmpty() != hash } == true }
+                }.collect { stale -> stale.forEach(::queueProfile) }
             }
             scope.launch {
                 for (jid in profileQueue) {
