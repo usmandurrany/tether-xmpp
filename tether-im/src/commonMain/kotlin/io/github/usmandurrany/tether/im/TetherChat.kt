@@ -13,6 +13,7 @@ import io.github.usmandurrany.tether.core.SessionContext
 import io.github.usmandurrany.tether.core.XmppClient
 import io.github.usmandurrany.tether.xml.Element
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalForInheritanceCoroutinesApi
 import kotlinx.coroutines.Job
@@ -144,9 +145,16 @@ public data class Contact(
  * is [Message.peer], [Message.outgoing] and [Message.id] together;
  * [MessageCodec] turns a whole message into one string, and
  * [MessageStoreCheck] tests an implementation.
+ *
+ * A store that can read one chat a page at a time sets [paged] and
+ * implements [chats] and [loadBefore] (with an index on peer and timestamp,
+ * say). [TetherChat] then keeps only each chat's newest messages in memory
+ * and reads older ones from the store as the user scrolls back
+ * ([TetherChat.loadOlder]), so a long history costs neither memory nor
+ * startup time. A store that does not is read whole at startup.
  */
 public interface MessageStore {
-    /** Every saved message, in any order. */
+    /** Every saved message, in any order. [TetherChat] reads it at startup when the store is not [paged]. */
     public suspend fun load(): List<Message>
 
     /** Adds the messages, or replaces those with the same [Message.peer], [Message.outgoing] and [Message.id]. */
@@ -157,6 +165,40 @@ public interface MessageStore {
 
     /** Forgets every message, on sign-out. */
     public suspend fun clear()
+
+    /** This store implements [chats] and [loadBefore] without reading every message. */
+    public val paged: Boolean get() = false
+
+    /** Everyone we have a saved message with. */
+    public suspend fun chats(): Set<BareJid> = load().mapTo(HashSet()) { it.peer }
+
+    /**
+     * Up to [limit] of [peer]'s messages that come before [before] in time
+     * order, newest first; the newest of the chat when [before] is null.
+     * Time order is [MessagePosition] order: by timestamp, then by
+     * [MessageCodec.keyOf] for equal times. With SQL:
+     *
+     * ```
+     * SELECT data FROM messages WHERE peer = ? AND (timestamp < ? OR (timestamp = ? AND message_key < ?))
+     * ORDER BY timestamp DESC, message_key DESC LIMIT ?
+     * ```
+     */
+    public suspend fun loadBefore(peer: BareJid, before: MessagePosition?, limit: Int): List<Message> =
+        load().asSequence()
+            .filter { it.peer == peer && (before == null || MessagePosition.of(it) < before) }
+            .sortedByDescending(MessagePosition::of)
+            .take(limit)
+            .toList()
+}
+
+/** Where a message sits in its chat's time order, for [MessageStore.loadBefore]. */
+public data class MessagePosition(val timestamp: Long, val key: String) : Comparable<MessagePosition> {
+    override fun compareTo(other: MessagePosition): Int =
+        if (timestamp != other.timestamp) timestamp.compareTo(other.timestamp) else key.compareTo(other.key)
+
+    public companion object {
+        public fun of(message: Message): MessagePosition = MessagePosition(message.timestamp, MessageCodec.keyOf(message))
+    }
 }
 
 /**
@@ -234,7 +276,11 @@ public class TetherChat(
     /** Deletions that arrived before the message they delete: (peer, outgoing, id). */
     private val pendingRetractions = MutableStateFlow<Set<Triple<BareJid, Boolean, String>>>(emptySet())
 
-    /** Every message, per contact, oldest first. */
+    /**
+     * The messages in memory, per contact, oldest first. With a paged
+     * [MessageStore] (the built-in ones are) that is each chat's newest
+     * messages plus any unread, and older pages once [loadOlder] brings them in.
+     */
     public val allMessages: StateFlow<Map<BareJid, List<Message>>> =
         // Derived without a coroutine, so `.value` is up to date the moment a call such as deleteForMe returns.
         MappedStateFlow(threads, visibleOnly())
@@ -330,6 +376,18 @@ public class TetherChat(
 
     private class Cursor(val before: String?, val complete: Boolean)
 
+    // Paging through the store, guarded by historyMutex: the oldest message read
+    // from the store per chat, and the chats that may have older ones there.
+    private val paged = messageStore?.paged == true
+    private val storeCursors = HashMap<BareJid, MessagePosition>()
+    private val storeHasMore = HashSet<BareJid>()
+
+    /** Chats whose archive paging has started from the oldest message held. */
+    private val archiveFromOldest = HashSet<BareJid>()
+
+    /** Done once the store's messages are in memory; history waits for it so it merges onto them. */
+    private val storeLoaded = CompletableDeferred<Unit>()
+
     init {
         client.install(SessionWatcher())
         // UNDISPATCHED: subscribed before the constructor returns, so no event is missed.
@@ -360,7 +418,11 @@ public class TetherChat(
         }
         if (messageStore != null) {
             scope.launch {
-                runCatching { messageStore.load() }.getOrNull()?.let { merge(it, fromStore = true) { old, new -> old.mergedWith(new) } }
+                try {
+                    loadFromStore(messageStore)
+                } finally {
+                    storeLoaded.complete(Unit)
+                }
                 for (first in saves) {
                     val ops = arrayListOf(first)
                     while (true) ops += saves.tryReceive().getOrNull() ?: break
@@ -376,6 +438,8 @@ public class TetherChat(
                     }
                 }
             }
+        } else {
+            storeLoaded.complete(Unit)
         }
         if (features.profiles) {
             // A contact's presence says when their picture changed: fetch the profile then.
@@ -454,7 +518,10 @@ public class TetherChat(
 
     // --- Messages ---------------------------------------------------------------------
 
-    /** One chat's messages, oldest first. */
+    /**
+     * One chat's messages, oldest first: the newest ones (and any unread) at
+     * first, then older ones as [loadOlder] brings them in.
+     */
     public fun messages(peer: BareJid): StateFlow<List<Message>> =
         allMessages.map { it[peer].orEmpty() }.distinctUntilChanged()
             .stateIn(scope, SharingStarted.WhileSubscribed(), allMessages.value[peer].orEmpty())
@@ -582,6 +649,8 @@ public class TetherChat(
     public fun closeChat(peer: BareJid) {
         openChats.update { it - peer }
         work.trySend { stopComposing(peer, tell = true) }
+        // Older pages the user scrolled back to go back to the store.
+        if (paged) scope.launch { trim(peer) }
     }
 
     /**
@@ -601,18 +670,34 @@ public class TetherChat(
     }
 
     /**
-     * Loads the page of history before the oldest message shown for [peer].
-     * Returns false when there is nothing older (or no archive on the server).
+     * Loads the page of history before the oldest message shown for [peer]:
+     * from the [MessageStore] while it has older messages (also offline),
+     * then from the server's archive. Call it when the user scrolls near the
+     * top. Returns false when there is nothing older (or, past the store, no
+     * archive on the server).
      */
     public suspend fun loadOlder(peer: BareJid): Boolean {
+        storeLoaded.await()
+        if (paged) {
+            val fromStore = historyMutex.withLock { if (peer in storeHasMore) loadStorePage(peer, PAGE) else 0 }
+            if (fromStore > 0) return true
+        }
         if (!features.history) return false
         awaitOnline()
         if (!im.history.available.value) return false
         return historyMutex.withLock {
             val cursor = cursors[peer]
             if (cursor?.complete == true) return@withLock false
-            val page = im.history.fetch(with = peer, before = cursor?.before, max = PAGE)
-            importPage(page, unread = false)
+            // The first time, go on from the oldest message we hold, so the archive does not repeat what the store gave.
+            val oldest = if (archiveFromOldest.add(peer)) threads.value[peer]?.firstOrNull { it.serverId != null }?.serverId else null
+            val page = try {
+                im.history.fetch(with = peer, before = oldest ?: cursor?.before, max = PAGE)
+            } catch (e: XmppStanzaException) {
+                // The archive no longer has that message.
+                if (oldest == null) throw e
+                im.history.fetch(with = peer, before = cursor?.before, max = PAGE)
+            }
+            importArchivePage(page, unread = false)
             cursors[peer] = Cursor(page.first ?: cursor?.before, page.complete || page.messages.isEmpty())
             !page.complete && page.messages.isNotEmpty()
         }
@@ -844,18 +929,127 @@ public class TetherChat(
         }
         // Messages read from the store are already saved there, unless a deletion changed them on the way in.
         val saveAdded: (Message) -> Boolean = if (fromStore) { m -> rewritten.any { it === m } } else { _ -> true }
-        for ((peer, batch) in arrived.groupBy { it.peer }) {
+        val groups = arrived.groupBy { it.peer }
+        if (groups.size == 1) {
+            val (peer, batch) = groups.entries.single()
             updateTracked(peer) { list -> mergeInto(list, batch, saveAdded, combine) }
+            return
+        }
+        // Many chats at once (a store load, an archive page): one change for all of them.
+        var changed = emptyList<Message>()
+        threads.update { all ->
+            val result = HashMap(all)
+            val toSave = ArrayList<Message>()
+            for ((peer, batch) in groups) {
+                val before = all[peer].orEmpty()
+                val (after, save) = mergeInto(before, batch, saveAdded, combine)
+                if (after !== before) {
+                    result[peer] = after
+                    toSave += save
+                }
+            }
+            changed = if (messageStore == null) emptyList() else toSave
+            if (result.size == all.size && result.all { (peer, list) -> all[peer] === list }) all else result
+        }
+        changed.forEach { saves.trySend(it to false) }
+    }
+
+    /**
+     * Reads the store at startup: all of it, or with a paged store each
+     * chat's newest messages, going further back while they are unread or
+     * all deleted for me, so unread counts and the chat list are complete.
+     */
+    private suspend fun loadFromStore(store: MessageStore) {
+        if (!paged) {
+            runCatching { store.load() }.getOrNull()?.let { merge(it, fromStore = true) { old, new -> old.mergedWith(new) } }
+            return
+        }
+        val chats = runCatching { store.chats() }.getOrNull() ?: return
+        val loaded = ArrayList<Message>()
+        historyMutex.withLock {
+            for (peer in chats) {
+                storeHasMore += peer
+                var page = readStore(store, peer, RECENT) ?: continue
+                loaded += page
+                while (peer in storeHasMore && page.last().let { it.hidden || (!it.outgoing && it.status == MessageStatus.UNREAD) }) {
+                    page = readStore(store, peer, PAGE) ?: break
+                    loaded += page
+                }
+            }
+        }
+        // Oldest first, so messages with equal times keep the store's order.
+        merge(loaded.asReversed(), fromStore = true) { old, new -> old.mergedWith(new) }
+    }
+
+    /** The next older page of [peer]'s chat from the store, newest first, moving the store cursor; null when there is none. */
+    private suspend fun readStore(store: MessageStore, peer: BareJid, limit: Int): List<Message>? {
+        val page = try {
+            store.loadBefore(peer, storeCursors[peer], limit)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            emptyList()
+        }
+        if (page.size < limit) storeHasMore -= peer
+        if (page.isEmpty()) return null
+        storeCursors[peer] = MessagePosition.of(page.last())
+        return page
+    }
+
+    /** Reads and shows the next older page of [peer] from the store. Call with [historyMutex] held. */
+    private suspend fun loadStorePage(peer: BareJid, limit: Int): Int {
+        val page = readStore(messageStore ?: return 0, peer, limit) ?: return 0
+        merge(page.asReversed(), fromStore = true) { old, new -> old.mergedWith(new) }
+        return page.size
+    }
+
+    /**
+     * Imports an archive page, first reading from the store as far back as
+     * the page goes, so an older message we deleted for me, read or saw
+     * ticked merges onto what we know instead of coming back as new.
+     * Call with [historyMutex] held.
+     */
+    private suspend fun importArchivePage(page: HistoryPage, unread: Boolean) {
+        if (paged) {
+            for (m in page.messages) {
+                val time = m.delayedAt?.let(::parseStamp) ?: continue
+                while (m.peer in storeHasMore && storeCursors[m.peer].let { it == null || it.timestamp >= time }) {
+                    if (loadStorePage(m.peer, RECENT) == 0) break
+                }
+            }
+        }
+        importPage(page, unread)
+    }
+
+    /** Drops [peer]'s older messages from memory once its chat is closed; they stay in the store. */
+    private suspend fun trim(peer: BareJid) {
+        historyMutex.withLock {
+            if (peer in openChats.value) return
+            var cutAt: Long? = null
+            threads.update { all ->
+                val list = all[peer] ?: return@update all
+                val firstUnread = list.indexOfFirst { !it.outgoing && it.status == MessageStatus.UNREAD }.let { if (it < 0) list.size else it }
+                var cut = minOf(list.size - RECENT, firstUnread)
+                // Cut between two times, so the store's order and ours agree on what is older.
+                while (cut > 0 && list[cut - 1].timestamp == list[cut].timestamp) cut--
+                if (cut <= 0) return@update all.also { cutAt = null }
+                cutAt = list[cut].timestamp
+                all + (peer to list.subList(cut, list.size).toList())
+            }
+            val time = cutAt ?: return
+            storeCursors[peer] = MessagePosition(time, "")
+            storeHasMore += peer
         }
     }
 
     private suspend fun loadNewest(peer: BareJid) {
+        storeLoaded.await()
         awaitOnline()
         if (!im.history.available.value) return
         historyMutex.withLock {
             if (cursors.containsKey(peer)) return
             val page = im.history.fetch(with = peer, max = PAGE)
-            importPage(page, unread = false)
+            importArchivePage(page, unread = false)
             cursors[peer] = Cursor(page.first, page.complete)
         }
     }
@@ -866,9 +1060,10 @@ public class TetherChat(
      * device that knows none, fills the chat list with the newest messages.
      */
     private suspend fun catchUp() {
+        storeLoaded.await()
         awaitOnline()
         if (!im.history.available.value) return
-        val newest = threads.value.values.flatten().filter { it.serverId != null }.maxByOrNull { it.timestamp }?.serverId
+        val newest = threads.value.values.mapNotNull { list -> list.lastOrNull { it.serverId != null } }.maxByOrNull { it.timestamp }?.serverId
         if (newest == null) {
             importPage(im.history.fetch(max = PAGE), unread = false)
             return
@@ -944,6 +1139,9 @@ public class TetherChat(
         const val PAGE = 50
         const val CATCH_UP_PAGES = 10
         const val SMALL_BATCH = 8
+
+        /** Messages per chat read from a paged store at startup, and kept when a chat closes. */
+        const val RECENT = 100
         const val TYPING_PAUSE_MILLIS = 5_000L
         const val TYPING_TIMEOUT_MILLIS = 30_000L
 

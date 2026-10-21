@@ -1,5 +1,6 @@
 package io.github.usmandurrany.tether.im
 
+import io.github.usmandurrany.tether.core.BareJid
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -21,14 +22,39 @@ import java.util.Base64
  * the old copies when it grows to several times what it holds. On POSIX
  * systems only the owner can read it.
  *
- * The file is not encrypted. Every message is kept in memory by [TetherChat]
- * anyway, so this suits chat histories of up to some hundred thousand
- * messages; use a database for more.
+ * It is [paged][MessageStore.paged]: [TetherChat] holds only each chat's
+ * newest messages and reads older ones from here. The store itself keeps
+ * every message's text in memory (about 0.5 KB each), so it suits histories
+ * of up to some hundred thousand messages; use a database for more.
+ *
+ * The file is not encrypted.
  */
 public class FileMessageStore(private val file: Path) : MessageStore {
     private val mutex = Mutex()
     private var live: LinkedHashMap<String, String>? = null
     private var lines = 0
+
+    /** Each chat's messages in time order, by key, alongside [live]. */
+    private val byChat = HashMap<BareJid, java.util.TreeMap<MessagePosition, String>>()
+    private val positions = HashMap<String, Pair<BareJid, MessagePosition>>()
+
+    override val paged: Boolean get() = true
+
+    override suspend fun chats(): Set<BareJid> = mutex.withLock {
+        io {
+            messages()
+            byChat.filterValues { it.isNotEmpty() }.keys.toSet()
+        }
+    }
+
+    override suspend fun loadBefore(peer: BareJid, before: MessagePosition?, limit: Int): List<Message> = mutex.withLock {
+        io {
+            messages()
+            val chat = byChat[peer] ?: return@io emptyList()
+            val older = if (before == null) chat.descendingMap() else chat.headMap(before, false).descendingMap()
+            older.values.asSequence().take(limit).mapNotNull(MessageCodec::decode).toList()
+        }
+    }
 
     override suspend fun load(): List<Message> = mutex.withLock {
         io { messages().values.mapNotNull(MessageCodec::decode) }
@@ -43,6 +69,7 @@ public class FileMessageStore(private val file: Path) : MessageStore {
                     messages.map { m ->
                         val text = MessageCodec.encode(m)
                         map[MessageCodec.keyOf(m)] = text
+                        indexAdd(m, text)
                         SAVE + encode(text)
                     },
                 )
@@ -60,6 +87,7 @@ public class FileMessageStore(private val file: Path) : MessageStore {
                     messages.map { m ->
                         val key = MessageCodec.keyOf(m)
                         map.remove(key)
+                        indexRemove(key)
                         DELETE + encode(key)
                     },
                 )
@@ -73,6 +101,8 @@ public class FileMessageStore(private val file: Path) : MessageStore {
             io {
                 Files.deleteIfExists(file)
                 live = LinkedHashMap()
+                byChat.clear()
+                positions.clear()
                 lines = 0
             }
         }
@@ -91,8 +121,14 @@ public class FileMessageStore(private val file: Path) : MessageStore {
                     count++
                     val payload = runCatching { decode(line.substring(1)) }.getOrNull() ?: continue
                     when (line.firstOrNull()) {
-                        SAVE -> MessageCodec.decode(payload)?.let { map[MessageCodec.keyOf(it)] = payload }
-                        DELETE -> map.remove(payload)
+                        SAVE -> MessageCodec.decode(payload)?.let {
+                            map[MessageCodec.keyOf(it)] = payload
+                            indexAdd(it, payload)
+                        }
+                        DELETE -> {
+                            map.remove(payload)
+                            indexRemove(payload)
+                        }
                     }
                 }
             }
@@ -100,6 +136,19 @@ public class FileMessageStore(private val file: Path) : MessageStore {
         live = map
         lines = count
         return map
+    }
+
+    private fun indexAdd(message: Message, text: String) {
+        val key = MessageCodec.keyOf(message)
+        indexRemove(key)
+        val position = MessagePosition.of(message)
+        byChat.getOrPut(message.peer) { java.util.TreeMap() }[position] = text
+        positions[key] = message.peer to position
+    }
+
+    private fun indexRemove(key: String) {
+        val (peer, position) = positions.remove(key) ?: return
+        byChat[peer]?.remove(position)
     }
 
     private fun append(newLines: List<String>) {
