@@ -287,7 +287,7 @@ public class TetherChat(
     @Volatile
     public var sendReadMarkers: Boolean = features.sendReadMarkers
 
-    private val threads = MutableStateFlow<Map<BareJid, List<Message>>>(emptyMap())
+    private val threads = MutableStateFlow(ShardedMap.empty<BareJid, List<Message>>())
     private val typingTokens = MutableStateFlow<Map<BareJid, Long>>(emptyMap())
     private val openChats = MutableStateFlow<Set<BareJid>>(emptySet())
     private val requests = MutableStateFlow<Set<BareJid>>(emptySet())
@@ -323,29 +323,70 @@ public class TetherChat(
         typingTokens.map { it.keys }.distinctUntilChanged().stateIn(scope, SharingStarted.Eagerly, emptySet())
 
     /** The chat list, most recent first. */
-    public val conversations: StateFlow<List<Conversation>> =
+    public val conversations: StateFlow<List<Conversation>> = run {
+        // Work per change grows with what changed: a chat's unread count is counted again only when its
+        // list changed, an unchanged entry keeps its object, and the sort runs over a list already in order
+        // but for the chat that moved.
+        val unread = UnreadCounts()
+        val previous = HashMap<BareJid, Conversation>()
+        var order = emptyList<BareJid>()
         combine(allMessages, typingContacts, people, im.presences.contacts, lastSeenTimes) { all, typing, people, online, seen ->
             val roster = people.roster
             val profiles = people.profiles
-            all.filterValues { it.isNotEmpty() }.map { (peer, messages) ->
-                Conversation(
+            val built = HashMap<BareJid, Conversation>(all.size * 2)
+            for ((peer, messages) in all) {
+                if (messages.isEmpty()) continue
+                val isOnline = !online[peer].isNullOrEmpty()
+                val fresh = Conversation(
                     peer = peer,
                     name = displayName(peer, roster[peer]?.name, profiles[peer]),
-                    lastMessage = messages.lastOrNull(),
-                    unreadCount = messages.count { it.status == MessageStatus.UNREAD },
+                    lastMessage = messages.last(),
+                    unreadCount = unread.of(peer, messages),
                     typing = peer in typing,
-                    online = !online[peer].isNullOrEmpty(),
-                    lastSeen = if (features.lastSeen && online[peer].isNullOrEmpty()) seen[peer] else null,
+                    online = isOnline,
+                    lastSeen = if (features.lastSeen && !isOnline) seen[peer] else null,
                     avatar = profiles[peer]?.avatar,
                     avatarHash = people.hashes[peer],
                 )
-            }.sortedByDescending { it.lastMessage?.timestamp ?: 0 }
+                built[peer] = previous[peer]?.takeIf { it == fresh } ?: fresh
+            }
+            unread.keepOnly(built.keys)
+            // Last order first (chats that left drop out, new ones go at the end), then a stable sort,
+            // which is linear on a list in order but for a few entries.
+            val seenPeers = HashSet<BareJid>(built.size * 2)
+            val list = ArrayList<Conversation>(built.size)
+            for (peer in order) built[peer]?.let { if (seenPeers.add(peer)) list += it }
+            for ((peer, c) in built) if (seenPeers.add(peer)) list += c
+            list.sortByDescending { it.lastMessage?.timestamp ?: 0 }
+            previous.clear()
+            previous.putAll(built)
+            order = list.map { it.peer }
+            list as List<Conversation>
         }.stateIn(scope, SharingStarted.Eagerly, emptyList())
+    }
 
     /** Unread messages in every chat, for an app badge. */
-    public val unreadCount: StateFlow<Int> =
-        allMessages.map { all -> all.values.sumOf { list -> list.count { it.status == MessageStatus.UNREAD } } }
-            .distinctUntilChanged().stateIn(scope, SharingStarted.Eagerly, 0)
+    public val unreadCount: StateFlow<Int> = run {
+        val unread = UnreadCounts()
+        allMessages.map { all ->
+            unread.keepOnly(all.keys)
+            all.entries.sumOf { (peer, list) -> unread.of(peer, list) }
+        }.distinctUntilChanged().stateIn(scope, SharingStarted.Eagerly, 0)
+    }
+
+    /** Each chat's unread count, counted again only when its list changes. Used from one coroutine at a time. */
+    private class UnreadCounts {
+        private val counts = HashMap<BareJid, Pair<List<Message>, Int>>()
+
+        fun of(peer: BareJid, list: List<Message>): Int {
+            counts[peer]?.let { (from, count) -> if (from === list) return count }
+            return list.count { it.status == MessageStatus.UNREAD }.also { counts[peer] = list to it }
+        }
+
+        fun keepOnly(peers: Set<BareJid>) {
+            if (counts.size > peers.size) counts.keys.retainAll(peers)
+        }
+    }
 
     /** The contact list, sorted by name. Empty when [ChatFeatures.contacts] is off. */
     public val contacts: StateFlow<List<Contact>> =
@@ -545,7 +586,7 @@ public class TetherChat(
         store?.let { runCatching { CredentialVault(it).clear(account) } }
         runCatching { rosterStore?.clear() }
         runCatching { messageStore?.clear() }
-        threads.value = emptyMap()
+        threads.value = ShardedMap.empty()
         close()
     }
 
@@ -946,7 +987,7 @@ public class TetherChat(
             val before = all[peer].orEmpty()
             val (after, toSave) = change(before)
             changed = if (after === before || messageStore == null) emptyList() else toSave
-            if (after === before) all else all + (peer to after)
+            if (after === before) all else all.with(peer, after)
         }
         changed.forEach { saves.trySend(it to false) }
     }
@@ -971,18 +1012,18 @@ public class TetherChat(
         // Many chats at once (a store load, an archive page): one change for all of them.
         var changed = emptyList<Message>()
         threads.update { all ->
-            val result = HashMap(all)
+            var result = all
             val toSave = ArrayList<Message>()
             for ((peer, batch) in groups) {
                 val before = all[peer].orEmpty()
                 val (after, save) = mergeInto(before, batch, saveAdded, combine)
                 if (after !== before) {
-                    result[peer] = after
+                    result = result.with(peer, after)
                     toSave += save
                 }
             }
             changed = if (messageStore == null) emptyList() else toSave
-            if (result.size == all.size && result.all { (peer, list) -> all[peer] === list }) all else result
+            result
         }
         changed.forEach { saves.trySend(it to false) }
     }
@@ -1067,7 +1108,7 @@ public class TetherChat(
                 while (cut > 0 && list[cut - 1].timestamp == list[cut].timestamp) cut--
                 if (cut <= 0) return@update all.also { cutAt = null }
                 cutAt = list[cut].timestamp
-                all + (peer to list.subList(cut, list.size).toList())
+                all.with(peer, list.subList(cut, list.size).toList())
             }
             val time = cutAt ?: return
             storeCursors[peer] = MessagePosition(time, "")
@@ -1215,16 +1256,21 @@ public class TetherChat(
          * object, so collectors of one chat see nothing when another changes.
          */
         fun visibleOnly(): (Map<BareJid, List<Message>>) -> Map<BareJid, List<Message>> {
-            var last: Pair<Map<BareJid, List<Message>>, Map<BareJid, List<Message>>>? = null
-            return { all ->
+            var last: Pair<ShardedMap<BareJid, List<Message>>, ShardedMap<BareJid, List<Message>>>? = null
+            return { input ->
+                val all = ShardedMap.of(input)
                 val previous = last
-                val result = all.mapValues { (peer, list) ->
-                    if (previous != null && previous.first[peer] === list) {
-                        previous.second.getValue(peer)
-                    } else if (list.none { it.hidden }) {
-                        list
-                    } else {
-                        list.filterNot { it.hidden }
+                // Only the parts of the map that changed are filtered again.
+                val result = all.mapShards(previous?.first, previous?.second) { shard ->
+                    shard.mapValues { (peer, list) ->
+                        val before = previous?.first?.get(peer)
+                        if (before === list) {
+                            previous.second.getValue(peer)
+                        } else if (list.none { it.hidden }) {
+                            list
+                        } else {
+                            list.filterNot { it.hidden }
+                        }
                     }
                 }
                 last = all to result
