@@ -9,6 +9,7 @@ import io.github.usmandurrany.tether.xml.element
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -176,6 +177,7 @@ class XmppSessionTest {
 
         val second = opener.live()
         assertFalse(second.resumed, "the server ended the session, so the next login is fresh")
+        assertEquals(0, fake.resumeAttempts, "no round trip spent asking to resume a session that was closed")
         assertNull(fake.fromClient.poll(300, TimeUnit.MILLISECONDS)?.takeIf { it.attribute("id") == "last" }, "nothing re-sent")
     }
 
@@ -189,6 +191,31 @@ class XmppSessionTest {
         withTimeout(10_000) { session.closeGracefully() }
         assertEquals(2L, fake.clientAcks.poll(5, TimeUnit.SECONDS), "<a h='2'/> before the close")
         assertTrue(fake.clientClosedStream)
+    }
+
+    @Test
+    fun gracefulCloseCollectsWhatTheServerHeldBackWhileInactive() = runBlocking<Unit> {
+        val fake = FakeXmppServer(streamManagement = true)
+        val session = opener(fake).live()
+        val held = scope.async { session.incoming.first { it.attribute("id") == "held" } }
+        // In the background: the server holds messages for an inactive client (MongooseIM's CSI buffer).
+        session.sendNonza(element("inactive", Ns.CSI))
+        withTimeout(5_000) { while (!fake.csiInactive) kotlinx.coroutines.delay(20) }
+        fake.deliver("<message from='romeo@localhost' id='held'><body>while away</body></message>")
+
+        withTimeout(10_000) { session.closeGracefully() }
+        assertEquals("while away", withTimeout(5_000) { held.await() }.child("body")?.text, "delivered before the close")
+        assertEquals(1L, fake.clientAcks.poll(5, TimeUnit.SECONDS), "and confirmed, so the server does not keep it")
+        assertTrue(fake.clientClosedStream)
+    }
+
+    @Test
+    fun aSlowConsumerDoesNotHoldBackAcks() = runBlocking<Unit> {
+        val fake = FakeXmppServer(streamManagement = true)
+        opener(fake).live() // Nobody reads its incoming stanzas.
+        repeat(400) { fake.push("<message from='romeo@localhost'><body>burst $it</body></message>") }
+        fake.push("<r xmlns='urn:xmpp:sm:3'/>")
+        assertEquals(400L, fake.clientAcks.poll(5, TimeUnit.SECONDS), "the server must not see a growing unconfirmed count")
     }
 
     @Test

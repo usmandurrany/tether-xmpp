@@ -68,6 +68,8 @@ public class ResumeRequest(
     public val streamManagement: StreamManagement,
     public val jid: FullJid,
     public val capabilities: ServerCapabilities,
+    /** False when the old session is known to be gone (it was closed cleanly): bind fresh at once, still carrying over what it had not confirmed. */
+    public val tryResume: Boolean = true,
 )
 
 /**
@@ -168,7 +170,7 @@ public class StreamNegotiator(
 
         val smOffered = postAuth.child("sm", Ns.SM) != null
         val previous = resume?.streamManagement
-        if (resume != null && previous != null && smOffered && previous.canResume) {
+        if (resume != null && previous != null && smOffered && previous.canResume && resume.tryResume) {
             if (tryResume(reader, previous)) {
                 return NegotiatedSession(
                     jid = resume.jid,

@@ -101,6 +101,11 @@ internal class FakeXmppServer(
     val clientAcks = LinkedBlockingQueue<Long>()
     @Volatile var connections = 0
     @Volatile var resumes = 0
+    @Volatile var resumeAttempts = 0
+
+    /** True after the client sent CSI `<inactive/>` (XEP-0352), until `<active/>`. */
+    @Volatile var csiInactive = false
+    private val held = java.util.concurrent.ConcurrentLinkedQueue<String>()
     @Volatile var clientClosedStream = false
     @Volatile private var smSessionEnded = false
 
@@ -125,6 +130,14 @@ internal class FakeXmppServer(
     /** Sends raw XML to the connected client. */
     fun push(xml: String) {
         current!!.send(xml)
+    }
+
+    /**
+     * Sends raw XML to the client, or holds it while the client is inactive,
+     * as MongooseIM's CSI buffer does; `<active/>` sends what was held.
+     */
+    fun deliver(xml: String) {
+        if (csiInactive) held += xml else push(xml)
     }
 
     /** Cuts the TCP connection without a stream close, like a dead mobile link. */
@@ -250,18 +263,26 @@ internal class FakeXmppServer(
                         smInbound = 0
                         c.send("<enabled xmlns='urn:xmpp:sm:3' id='$smId' resume='true' max='300'/>")
                     }
-                    "resume" -> if (allowResume && !smSessionEnded && el.attribute("previd") == smId) {
+                    "resume" -> {
+                        resumeAttempts++
                         smInbound -= lostInTransit
-                        smOn = true
-                        resumes++
-                        c.send("<resumed xmlns='urn:xmpp:sm:3' previd='$smId' h='$smInbound'/>")
-                    } else {
-                        smInbound -= lostInTransit
-                        c.send("<failed xmlns='urn:xmpp:sm:3' h='$smInbound'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></failed>")
+                        if (allowResume && !smSessionEnded && el.attribute("previd") == smId) {
+                            smOn = true
+                            resumes++
+                            c.send("<resumed xmlns='urn:xmpp:sm:3' previd='$smId' h='$smInbound'/>")
+                        } else {
+                            c.send("<failed xmlns='urn:xmpp:sm:3' h='$smInbound'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></failed>")
+                        }
                     }
                     "r" -> if (!silent) c.send("<a xmlns='urn:xmpp:sm:3' h='$smInbound'/>")
                     "a" -> clientAcks += el.attribute("h")!!.toLong()
                 }
+                continue
+            }
+            if (el.namespace == "urn:xmpp:csi:0") {
+                csiInactive = el.name == "inactive"
+                if (!csiInactive) while (true) c.send(held.poll() ?: break)
+                fromClient += el
                 continue
             }
             if (smOn && el.namespace == "jabber:client") smInbound++
