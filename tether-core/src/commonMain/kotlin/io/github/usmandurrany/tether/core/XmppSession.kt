@@ -34,8 +34,14 @@ internal class SmSnapshot(
 public data class SessionPolicy(
     /** With SM on, ask the server to confirm after this many unconfirmed stanzas (XEP-0198 §4). */
     val requestAckEvery: Int = 5,
-    /** Incoming stanzas buffered before reading pauses, so a slow consumer pushes back on the server. */
-    val incomingBuffer: Int = 256,
+    /**
+     * Incoming stanzas buffered before reading pauses. Unlimited by default:
+     * while reading is paused, the server's `<r/>` goes unanswered, and
+     * servers that cap unconfirmed stanzas (MongooseIM's default is 100) end
+     * the stream with `<resource-constraint/>`, as seen during a burst of
+     * redelivered messages. A limit trades that for bounded memory.
+     */
+    val incomingBuffer: Int = Channel.UNLIMITED,
 ) {
     init {
         require(requestAckEvery >= 1 && incomingBuffer >= 1)
@@ -108,7 +114,7 @@ public class XmppSession private constructor(
     /** Keys derived at login (null for a resumed session or PLAIN); store them to log in without the password. */
     public val scramKeys: io.github.usmandurrany.tether.sasl.ScramKeys? get() = negotiated.scramKeys
 
-    /** Set when this session was ended with `</stream:stream>`: the server dropped it, so it cannot be resumed. */
+    /** Set once this session sent `</stream:stream>`: the server drops it, so it cannot be resumed. */
     @Volatile
     internal var endedGracefully: Boolean = false
         private set
@@ -245,24 +251,32 @@ public class XmppSession private constructor(
     }
 
     /**
-     * Ends the session cleanly: with SM, first asks the server to confirm what
-     * is still unconfirmed, then sends `</stream:stream>` and waits briefly for
-     * the server's own close. The server then treats the account as offline at
-     * once (RFC 6120 §4.4), which is what routes new messages to push.
+     * Ends the session cleanly, without leaving anything behind on either side:
+     * 1. With CSI (XEP-0352), reports active, so the server sends what it held
+     *    back while the app was in the background. A server that buffers for
+     *    inactive clients (MongooseIM does) would otherwise keep those stanzas
+     *    past the close and only deliver them minutes later.
+     * 2. One round trip (SM `<r/>`, or a ping without SM): everything the
+     *    server sent before its answer has then been read and counted, and
+     *    what we sent is confirmed.
+     * 3. Confirms what we received, sends `</stream:stream>`, and waits
+     *    briefly for the server's own close. The server then treats the
+     *    account as offline at once (RFC 6120 §4.4), which is what routes new
+     *    messages to push.
      * Stanzas still unconfirmed stay queued for the next session.
      */
     override suspend fun closeGracefully() {
         if (closed) return
-        endedGracefully = true
         try {
-            if (sm != null && lock.withLock { sm.unackedCount } > 0) {
-                withTimeoutOrNull(2_000) { probe() }
-            }
+            val csi = capabilities.hasStreamFeature("csi", Ns.CSI)
+            if (csi) runCatching { sendNonza(element("active", Ns.CSI)) }
+            if (loopStarted && (sm != null || csi)) withTimeoutOrNull(2_000) { probe() }
             lock.withLock {
                 if (!closed) {
                     // Confirm what we received, so the server does not treat it as undelivered on close.
                     if (sm != null) write(element("a", Ns.SM) { attribute("h", sm.inbound.toString()) })
                     reader.sendStreamClose()
+                    endedGracefully = true
                 }
             }
             // The server answers with its own </stream:stream>; the read loop then ends.
@@ -444,7 +458,12 @@ public class XmppSessionOpener(
         // The old read loop must have stopped so its SM counters are final.
         last?.awaitEnded(timeoutMillis = 5_000)
         // A saved session is tried until an attempt gets through, whatever its outcome then.
-        val resume = if (last == null) restored else last.streamManagement?.let { ResumeRequest(it, last.jid, last.capabilities) }
+        // After a clean close the server has dropped the session: asking to resume it only costs a round trip.
+        val resume = if (last == null) {
+            restored
+        } else {
+            last.streamManagement?.let { ResumeRequest(it, last.jid, last.capabilities, tryResume = !last.endedGracefully) }
+        }
         val session = XmppSession.start(negotiator.negotiate(resume), policy, onConfirmed)
         previous = session
         restored = null
