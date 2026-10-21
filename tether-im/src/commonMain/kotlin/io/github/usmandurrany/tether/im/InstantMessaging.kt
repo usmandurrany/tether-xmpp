@@ -37,6 +37,14 @@ public data class ChatFeatures(
     val multiDevice: Boolean = true,
     /** The server's message archive (XEP-0313): fills chats on a new device and catches up after being offline. */
     val history: Boolean = true,
+    /**
+     * After a new login, at most this many archive entries (messages,
+     * receipts and read markers) are fetched to catch up on what happened
+     * while offline, going forward from the newest message we know. More
+     * catches up more after a long time offline, at the cost of data and time
+     * at each login. 0 turns catch-up off. Needs [history].
+     */
+    val catchUpLimit: Int = 500,
     /** When contacts were last online (XEP-0012), on [TetherChat.contacts] and [TetherChat.conversations]. Needs [presence]. */
     val lastSeen: Boolean = true,
     /**
@@ -89,7 +97,7 @@ public class InstantMessaging(
 ) {
     public val roster: Roster = Roster(client, rosterStore)
     public val carbons: Carbons = Carbons()
-    public val presences: Presences = Presences(client, presence)
+    public val presences: Presences = Presences(client, presence, scope = client.coroutineScope)
     public val messaging: Messaging = Messaging(
         client,
         sendReceipts = features.deliveryReceipts,

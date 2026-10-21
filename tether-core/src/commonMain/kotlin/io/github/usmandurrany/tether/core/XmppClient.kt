@@ -255,8 +255,15 @@ public class XmppClient(
         }
     }
 
-    private fun saveSoon() {
-        if (store != null) saveRequests.trySend(Unit)
+    /**
+     * Writes the state soon. In the foreground the state lives in memory and is
+     * written only when it matters: a session opened or closed, or a message
+     * with a body sent (so it survives a crash before the server confirms it).
+     * In the background, where the OS may kill the process at any moment,
+     * every change is written. Going to the background writes it too.
+     */
+    private fun saveSoon(important: Boolean = false) {
+        if (store != null && (important || !_foreground.value)) saveRequests.trySend(Unit)
     }
 
     /** Stops for good and closes the connection. */
@@ -296,7 +303,7 @@ public class XmppClient(
                 true
             }
         }
-        saveSoon()
+        saveSoon(important = stamped.name == "message" && stamped.child("body", Ns.CLIENT) != null)
         // Not proof of delivery until the server confirms: check now rather than at the next idle probe.
         if (written && policy.confirmEachMessage && stamped.name == "message" && stamped.child("body", Ns.CLIENT) != null) {
             supervisor.checkConnection()
@@ -363,7 +370,7 @@ public class XmppClient(
                 launch { session.incoming.collect { dispatch(it) } }
                 session.awaitClosed()
                 _session.compareAndSet(session, null)
-                saveSoon()
+                saveSoon(important = true)
             }
             try {
                 val context = object : SessionContext {
@@ -392,7 +399,7 @@ public class XmppClient(
                 // It may have ended meanwhile; the reader has then already run.
                 if (!session.isOpen) _session.compareAndSet(session, null)
                 if (!session.resumed) session.scramKeys?.let { keys -> runCatching { credentials?.saveKeys(account, keys) } }
-                saveSoon()
+                saveSoon(important = true)
                 return session
             } catch (t: Throwable) {
                 session.close()

@@ -102,6 +102,8 @@ public object TetherAndroid {
         store: KeyValueStore = secureStore(context),
         /** Keeps messages, ticks and deletions between runs; null keeps them in memory only. */
         messageStore: MessageStore? = SqliteMessageStore(context, jid),
+        /** Keeps the contact list, apart from [store] so the client's state stays small to write. */
+        contactStore: KeyValueStore? = PreferencesStore(context, "tether.contacts"),
         logger: TrafficLogger? = null,
         rememberLogin: Boolean = true,
     ): TetherChat {
@@ -111,7 +113,7 @@ public object TetherAndroid {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val client = XmppClient(negotiator(context, config, logger), scope, policy, store = store, credentials = vault.takeIf { rememberLogin })
         val binding = bind(context, client, scope)
-        return TetherChat(client, features, store, messageStore, resources = binding)
+        return TetherChat(client, features, store, messageStore, resources = binding, contactStore = contactStore)
     }
 
     /**

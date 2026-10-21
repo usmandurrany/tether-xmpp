@@ -35,6 +35,10 @@ public class StoredRoster(private val store: KeyValueStore, account: BareJid) : 
         store.put(key, null)
     }
 
+    internal suspend fun clearIfPresent() {
+        if (store.get(key) != null) store.put(key, null)
+    }
+
     override suspend fun save(snapshot: RosterSnapshot) {
         val query = element("query", ImNs.ROSTER) {
             attribute("ver", snapshot.version)

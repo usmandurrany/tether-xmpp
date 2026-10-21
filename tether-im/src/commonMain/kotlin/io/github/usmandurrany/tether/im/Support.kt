@@ -3,6 +3,14 @@ package io.github.usmandurrany.tether.im
 import io.github.usmandurrany.tether.core.BareJid
 import io.github.usmandurrany.tether.xml.Element
 import io.github.usmandurrany.tether.xml.element
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlin.random.Random
 
 internal object ImNs {
@@ -65,4 +73,34 @@ internal fun Element.requireResult(): Element {
 internal fun fromOwnAccount(stanza: Element, own: BareJid?): Boolean {
     val from = stanza.attribute("from") ?: return true
     return own != null && from == own.toString()
+}
+
+/**
+ * A map changed one entry at a time and read as a [StateFlow] of snapshots.
+ * With a [scope], snapshots are published by a coroutine of their own, so a
+ * burst of changes (thousands of presences at login) is copied a few times
+ * instead of once per change. Without one, every change publishes at once.
+ */
+internal class BatchedMap<K, V>(private val scope: CoroutineScope?) {
+    private val live = HashMap<K, V>()
+    private val lock = Mutex()
+    private val _flow = MutableStateFlow<Map<K, V>>(emptyMap())
+    private val dirty = Channel<Unit>(Channel.CONFLATED)
+
+    val flow: StateFlow<Map<K, V>> = _flow.asStateFlow()
+
+    init {
+        scope?.launch { for (signal in dirty) publish() }
+    }
+
+    /** Changes the map; [change] returns whether anything changed. */
+    suspend fun update(change: (MutableMap<K, V>) -> Boolean) {
+        val changed = lock.withLock { change(live) }
+        if (!changed) return
+        if (scope == null) publish() else dirty.trySend(Unit)
+    }
+
+    private suspend fun publish() {
+        _flow.value = lock.withLock { HashMap(live) }
+    }
 }

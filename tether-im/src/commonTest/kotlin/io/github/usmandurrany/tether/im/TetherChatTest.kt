@@ -397,6 +397,18 @@ class TetherChatTest {
     }
 
     @Test
+    fun thePictureHashIsShownWithoutFetchingTheProfile() = runTest {
+        val h = harness()
+        h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>hi</body></message>")
+        val presence = xml("<presence from='romeo@example.net/o'><x xmlns='vcard-temp:x:update'><photo>abc123</photo></x></presence>")
+        h.chat.im.profiles.onStanza(presence)
+        h.chat.im.presences.onStanza(presence)
+        runCurrent()
+        assertEquals("abc123", h.chat.conversations.value.single().avatarHash)
+        assertNull(h.chat.conversations.value.single().avatar, "not downloaded until the app asks or the chat opens")
+    }
+
+    @Test
     fun aContactWhoGoesOfflineShowsWhenTheyWereLastSeen() = runTest {
         val h = harness()
         h.incoming("<message from='romeo@example.net/o' type='chat' id='r1'><body>hi</body></message>")

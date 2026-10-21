@@ -25,7 +25,8 @@ import java.nio.file.Path
  * saved in [store] (throws [IllegalArgumentException] when there are none).
  * State and login keys are kept in [store]: by default a file only this user
  * can read, `~/.tether/<account>.properties`. Messages are kept in
- * [messageStore], by default `~/.tether/<account>.messages`. The client runs on its own
+ * [messageStore], by default `~/.tether/<account>.messages`, and the contact
+ * list in [contactStore], by default `~/.tether/<account>.contacts`. The client runs on its own
  * background threads until [TetherChat.close].
  *
  * Network changes are followed on their own. Tell the chat when the window
@@ -44,13 +45,15 @@ public suspend fun TetherJvm.chat(
     store: KeyValueStore = FileKeyValueStore(defaultStorePath(jid, "properties")),
     /** Keeps messages, ticks and deletions between runs; null keeps them in memory only. */
     messageStore: MessageStore? = FileMessageStore(defaultStorePath(jid, "messages")),
+    /** Keeps the contact list, apart from [store] so the client's state stays small to write. */
+    contactStore: KeyValueStore? = FileKeyValueStore(defaultStorePath(jid, "contacts")),
     logger: TrafficLogger? = null,
     rememberLogin: Boolean = true,
 ): TetherChat {
     val config = options.configFor(jid, password, CredentialVault(store))
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     val client = client(config, scope, policy, store, logger, rememberLogin)
-    return TetherChat(client, features, store, messageStore)
+    return TetherChat(client, features, store, messageStore, contactStore = contactStore)
 }
 
 private fun defaultStorePath(jid: BareJid, extension: String): Path =

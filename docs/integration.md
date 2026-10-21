@@ -143,6 +143,7 @@ ChatFeatures(
     presence = true,           // contacts' online status and requests
     multiDevice = true,        // messages from our other devices (carbons, XEP-0280)
     history = true,            // the server archive (XEP-0313)
+    catchUpLimit = 500,        // how much of the archive a login catches up on; 0 = none
     lastSeen = true,           // when offline contacts were last online (XEP-0012)
     deleteForEveryone = true,  // delete for everyone, both ways (XEP-0424)
     autoAcceptContacts = false, // accept every contact request at once (off by default)
@@ -163,7 +164,9 @@ Messages are kept on the device by default, so ticks, read state, deletions and 
 
 There's nothing to set up. `signOut()` empties the store. Both built-in stores are *paged*: the SDK reads each chat's newest messages at startup, and older ones a page at a time as the user scrolls back. Pass `messageStore = null` to keep messages in memory only; the SDK then rebuilds recent chats from the server archive after a restart.
 
-After each new sign-in the SDK also catches up from the archive: messages sent and received on other devices while this one was offline appear, and ones read elsewhere are marked read.
+After each new sign-in the SDK also catches up from the archive: messages sent and received on other devices while this one was offline appear, and ones read elsewhere are marked read. It fetches at most `ChatFeatures.catchUpLimit` archive entries (500 by default), so a login after a long time offline stays quick; raise it to catch up on more, or set 0 to skip catch-up.
+
+The contact list is kept apart from the connection state: in private preferences on Android (`contactStore`, a `PreferencesStore`) and in `~/.tether/<account>.contacts` on the desktop. The connection state itself lives in memory while the app is in use and is written when it matters: when a connection opens or drops, when a message you wrote is sent, and when the app goes to the background.
 
 ### Using your own database
 
@@ -370,12 +373,18 @@ To ask at another time, call `chat.lastSeen(peer)`. The contact's server only an
 Each account has a public profile (a vCard, XEP-0054): names, email, phone, a short "about" and a picture. With `ChatFeatures.profiles` on (the default) there is little to do:
 
 - `chat.myProfile` holds ours, read from the server on each login.
-- `Contact.avatar` and `Conversation.avatar` hold contacts' pictures, and `name` falls back to their profile's nickname or full name when you gave them none.
-- Contacts' apps announce a new picture in their presence (XEP-0153). The SDK then fetches their profile, and also when a chat opens with someone it has none for.
+- `Contact.avatarHash` and `Conversation.avatarHash` say which picture each contact has (a SHA-1 that changes with the picture, `""` for none), straight from their presence (XEP-0153). The SDK does not download pictures on its own: caching them is up to your app, keyed by this hash.
+- `chat.profile(jid)` fetches a profile when you want it (`refresh = true` when the hash no longer matches your cached picture). The SDK also fetches it when a chat opens, and again if that contact changes picture while the chat is open.
+- `Contact.avatar` and `Conversation.avatar` hold the picture once fetched, and `name` falls back to the profile's nickname or full name when you gave them none.
 
 ```kotlin
-// Show a picture.
-contact.avatar?.let { image(it.data, it.type) } ?: initials(contact.name)
+// Show a picture from your own cache, keyed by hash; fetch it when missing.
+val hash = contact.avatarHash
+val cached = hash?.takeIf { it.isNotEmpty() }?.let { imageCache[it] }
+if (cached != null) image(cached) else initials(contact.name)
+if (hash != null && hash.isNotEmpty() && cached == null) scope.launch {
+    chat.profile(contact.jid, refresh = true)?.avatar?.let { imageCache[it.hash] = it.data }
+}
 
 // Change ours: copy the current one so fields you don't edit are kept.
 val mine = chat.myProfile.value ?: Profile()
@@ -387,7 +396,7 @@ val profile = chat.profile(romeo)
 
 - **Keep pictures small:** a 192×192 JPEG of 10–30 KB. The picture travels inside one stanza, and servers cap stanza size (ejabberd's default is 64 KB once encoded).
 - **Fields the SDK doesn't model** (addresses, a second email) are in `Profile.other`, and saving a copy keeps them.
-- **Pictures are kept in memory only.** They come back from the server after a restart. To show them offline, save `chat.profiles` in your own cache.
+- **Pictures are kept in memory only, and only those fetched.** Save them in your own cache (by `avatar.hash`) to show them offline and to avoid downloading them again.
 - `updateMyProfile` needs a connection and throws `XmppStanzaException` if the server refuses (too large, say).
 
 ## Deleting messages

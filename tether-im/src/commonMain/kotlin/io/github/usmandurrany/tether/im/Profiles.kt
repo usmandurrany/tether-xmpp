@@ -157,10 +157,10 @@ public class Profiles internal constructor(
     /** Contacts' profiles fetched so far, kept in memory. */
     public val known: StateFlow<Map<BareJid, Profile>> = _known.asStateFlow()
 
-    private val _avatarHashes = MutableStateFlow<Map<BareJid, String>>(emptyMap())
+    private val hashes = BatchedMap<BareJid, String>(scope)
 
     /** The picture each contact's presence advertises: a SHA-1 hex, or "" for no picture. */
-    public val avatarHashes: StateFlow<Map<BareJid, String>> = _avatarHashes.asStateFlow()
+    public val avatarHashes: StateFlow<Map<BareJid, String>> = hashes.flow
 
     /** Our picture's hash; null while unknown. */
     @Volatile
@@ -197,7 +197,7 @@ public class Profiles internal constructor(
             // Another of our devices changed the picture.
             if (hash != ownHash) scope.launch { runCatching { refreshMine() } }
         } else {
-            _avatarHashes.update { if (it[from] == hash) it else it + (from to hash) }
+            hashes.update { all -> (all[from] != hash).also { if (it) all[from] = hash } }
         }
         return false // Presences reads the rest.
     }

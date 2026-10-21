@@ -110,8 +110,15 @@ public data class Conversation(
     val online: Boolean,
     /** When the contact was last online, in milliseconds since the epoch; null while online or when unknown. */
     val lastSeen: Long? = null,
-    /** Their profile picture, once fetched. */
+    /** Their profile picture, once fetched with [TetherChat.profile] or by opening the chat. */
     val avatar: Avatar? = null,
+    /**
+     * The picture their presence advertises: a SHA-1 hex that changes when
+     * they change it, "" for no picture, null when unknown. The SDK does not
+     * download pictures on its own: cache them by this hash and fetch with
+     * [TetherChat.profile] (`refresh = true` when the hash no longer matches).
+     */
+    val avatarHash: String? = null,
 )
 
 /** One entry of the contact list, with what we know of their presence. */
@@ -130,8 +137,15 @@ public data class Contact(
     val groups: Set<String>,
     /** When they were last online, in milliseconds since the epoch; null while online or when unknown. */
     val lastSeen: Long? = null,
-    /** Their profile picture, once fetched. */
+    /** Their profile picture, once fetched with [TetherChat.profile] or by opening the chat. */
     val avatar: Avatar? = null,
+    /**
+     * The picture their presence advertises: a SHA-1 hex that changes when
+     * they change it, "" for no picture, null when unknown. The SDK does not
+     * download pictures on its own: cache them by this hash and fetch with
+     * [TetherChat.profile] (`refresh = true` when the hash no longer matches).
+     */
+    val avatarHash: String? = null,
 )
 
 /**
@@ -243,14 +257,20 @@ public class TetherChat(
     /** The connection. Prefer [connect], [disconnect] and [close] here to calling it directly. */
     public val client: XmppClient,
     public val features: ChatFeatures = ChatFeatures(),
-    /** Keeps the contact list between runs; normally the same store the client keeps its state in. */
+    /** The store the client keeps its state and login keys in; [signOut] clears the keys. */
     private val store: KeyValueStore? = null,
     private val messageStore: MessageStore? = null,
     presence: OwnPresence = OwnPresence(),
     /** Closed with the chat, for platform wiring such as lifecycle observers. */
     private val resources: AutoCloseable? = null,
+    /**
+     * Keeps the contact list between runs. Best kept apart from [store]: a
+     * contact list of thousands is large, and the client's state is written
+     * often. Defaults to [store].
+     */
+    contactStore: KeyValueStore? = store,
 ) {
-    private val rosterStore = store?.let { StoredRoster(it, client.account) }
+    private val rosterStore = contactStore?.let { StoredRoster(it, client.account) }
 
     /** The protocol-level features, for advanced use. */
     public val im: InstantMessaging = InstantMessaging(client, rosterStore, presence, features)
@@ -267,7 +287,7 @@ public class TetherChat(
     @Volatile
     public var sendReadMarkers: Boolean = features.sendReadMarkers
 
-    private val threads = MutableStateFlow<Map<BareJid, List<Message>>>(emptyMap())
+    private val threads = MutableStateFlow(ShardedMap.empty<BareJid, List<Message>>())
     private val typingTokens = MutableStateFlow<Map<BareJid, Long>>(emptyMap())
     private val openChats = MutableStateFlow<Set<BareJid>>(emptySet())
     private val requests = MutableStateFlow<Set<BareJid>>(emptySet())
@@ -291,41 +311,88 @@ public class TetherChat(
             (asked.keys + watched.keys).associateWith { maxOf(asked[it] ?: 0, watched[it] ?: 0) }
         }.stateIn(scope, SharingStarted.Eagerly, emptyMap())
 
-    /** Roster entries and fetched profiles, which together give names and pictures. */
-    private val people: StateFlow<Pair<Map<BareJid, RosterItem>, Map<BareJid, Profile>>> =
-        combine(im.roster.items, im.profiles.known) { roster, profiles -> roster to profiles }
-            .stateIn(scope, SharingStarted.Eagerly, im.roster.items.value to im.profiles.known.value)
+    /** Roster entries, fetched profiles and advertised picture hashes, which together give names and pictures. */
+    private val people: StateFlow<People> =
+        combine(im.roster.items, im.profiles.known, im.profiles.avatarHashes, ::People)
+            .stateIn(scope, SharingStarted.Eagerly, People(im.roster.items.value, im.profiles.known.value, im.profiles.avatarHashes.value))
+
+    private class People(val roster: Map<BareJid, RosterItem>, val profiles: Map<BareJid, Profile>, val hashes: Map<BareJid, String>)
 
     /** Contacts typing right now. */
     public val typingContacts: StateFlow<Set<BareJid>> =
         typingTokens.map { it.keys }.distinctUntilChanged().stateIn(scope, SharingStarted.Eagerly, emptySet())
 
     /** The chat list, most recent first. */
-    public val conversations: StateFlow<List<Conversation>> =
-        combine(allMessages, typingContacts, people, im.presences.contacts, lastSeenTimes) { all, typing, (roster, profiles), online, seen ->
-            all.filterValues { it.isNotEmpty() }.map { (peer, messages) ->
-                Conversation(
+    public val conversations: StateFlow<List<Conversation>> = run {
+        // Work per change grows with what changed: a chat's unread count is counted again only when its
+        // list changed, an unchanged entry keeps its object, and the sort runs over a list already in order
+        // but for the chat that moved.
+        val unread = UnreadCounts()
+        val previous = HashMap<BareJid, Conversation>()
+        var order = emptyList<BareJid>()
+        combine(allMessages, typingContacts, people, im.presences.contacts, lastSeenTimes) { all, typing, people, online, seen ->
+            val roster = people.roster
+            val profiles = people.profiles
+            val built = HashMap<BareJid, Conversation>(all.size * 2)
+            for ((peer, messages) in all) {
+                if (messages.isEmpty()) continue
+                val isOnline = !online[peer].isNullOrEmpty()
+                val fresh = Conversation(
                     peer = peer,
                     name = displayName(peer, roster[peer]?.name, profiles[peer]),
-                    lastMessage = messages.lastOrNull(),
-                    unreadCount = messages.count { it.status == MessageStatus.UNREAD },
+                    lastMessage = messages.last(),
+                    unreadCount = unread.of(peer, messages),
                     typing = peer in typing,
-                    online = !online[peer].isNullOrEmpty(),
-                    lastSeen = if (features.lastSeen && online[peer].isNullOrEmpty()) seen[peer] else null,
+                    online = isOnline,
+                    lastSeen = if (features.lastSeen && !isOnline) seen[peer] else null,
                     avatar = profiles[peer]?.avatar,
+                    avatarHash = people.hashes[peer],
                 )
-            }.sortedByDescending { it.lastMessage?.timestamp ?: 0 }
+                built[peer] = previous[peer]?.takeIf { it == fresh } ?: fresh
+            }
+            unread.keepOnly(built.keys)
+            // Last order first (chats that left drop out, new ones go at the end), then a stable sort,
+            // which is linear on a list in order but for a few entries.
+            val seenPeers = HashSet<BareJid>(built.size * 2)
+            val list = ArrayList<Conversation>(built.size)
+            for (peer in order) built[peer]?.let { if (seenPeers.add(peer)) list += it }
+            for ((peer, c) in built) if (seenPeers.add(peer)) list += c
+            list.sortByDescending { it.lastMessage?.timestamp ?: 0 }
+            previous.clear()
+            previous.putAll(built)
+            order = list.map { it.peer }
+            list as List<Conversation>
         }.stateIn(scope, SharingStarted.Eagerly, emptyList())
+    }
 
     /** Unread messages in every chat, for an app badge. */
-    public val unreadCount: StateFlow<Int> =
-        allMessages.map { all -> all.values.sumOf { list -> list.count { it.status == MessageStatus.UNREAD } } }
-            .distinctUntilChanged().stateIn(scope, SharingStarted.Eagerly, 0)
+    public val unreadCount: StateFlow<Int> = run {
+        val unread = UnreadCounts()
+        allMessages.map { all ->
+            unread.keepOnly(all.keys)
+            all.entries.sumOf { (peer, list) -> unread.of(peer, list) }
+        }.distinctUntilChanged().stateIn(scope, SharingStarted.Eagerly, 0)
+    }
+
+    /** Each chat's unread count, counted again only when its list changes. Used from one coroutine at a time. */
+    private class UnreadCounts {
+        private val counts = HashMap<BareJid, Pair<List<Message>, Int>>()
+
+        fun of(peer: BareJid, list: List<Message>): Int {
+            counts[peer]?.let { (from, count) -> if (from === list) return count }
+            return list.count { it.status == MessageStatus.UNREAD }.also { counts[peer] = list to it }
+        }
+
+        fun keepOnly(peers: Set<BareJid>) {
+            if (counts.size > peers.size) counts.keys.retainAll(peers)
+        }
+    }
 
     /** The contact list, sorted by name. Empty when [ChatFeatures.contacts] is off. */
     public val contacts: StateFlow<List<Contact>> =
-        combine(people, im.presences.contacts, lastSeenTimes) { (roster, profiles), online, seen ->
-            roster.values.map { item ->
+        combine(people, im.presences.contacts, lastSeenTimes) { people, online, seen ->
+            val profiles = people.profiles
+            people.roster.values.map { item ->
                 val best = online[item.jid].orEmpty().maxByOrNull { it.priority }
                 Contact(
                     jid = item.jid,
@@ -338,6 +405,7 @@ public class TetherChat(
                     groups = item.groups,
                     lastSeen = if (features.lastSeen && best == null) seen[item.jid] else null,
                     avatar = profiles[item.jid]?.avatar,
+                    avatarHash = people.hashes[item.jid],
                 )
             }.sortedBy { it.name.lowercase() }
         }.stateIn(scope, SharingStarted.Eagerly, emptyList())
@@ -389,6 +457,10 @@ public class TetherChat(
     private val storeLoaded = CompletableDeferred<Unit>()
 
     init {
+        if (store != null && contactStore != null && contactStore !== store) {
+            // Earlier versions kept the contact list next to the client's state: drop that copy.
+            scope.launch { runCatching { StoredRoster(store, client.account).clearIfPresent() } }
+        }
         client.install(SessionWatcher())
         // UNDISPATCHED: subscribed before the constructor returns, so no event is missed.
         scope.launch(start = CoroutineStart.UNDISPATCHED) { im.messaging.events.collect(::onEvent) }
@@ -442,12 +514,14 @@ public class TetherChat(
             storeLoaded.complete(Unit)
         }
         if (features.profiles) {
-            // A contact's presence says when their picture changed: fetch the profile then.
+            // Profiles are fetched for chats on screen only (and on request, with [profile]):
+            // fetching every contact's on each login costs a request and a picture each.
+            // An open chat whose contact changed their picture gets the new one.
             scope.launch {
-                im.profiles.avatarHashes.collect { hashes ->
+                combine(im.profiles.avatarHashes, openChats) { hashes, open ->
                     val known = im.profiles.known.value
-                    hashes.forEach { (jid, hash) -> if (known[jid]?.avatar?.hash.orEmpty() != hash || jid !in known) queueProfile(jid) }
-                }
+                    open.filter { jid -> hashes[jid]?.let { hash -> known[jid]?.avatar?.hash.orEmpty() != hash } == true }
+                }.collect { stale -> stale.forEach(::queueProfile) }
             }
             scope.launch {
                 for (jid in profileQueue) {
@@ -512,7 +586,7 @@ public class TetherChat(
         store?.let { runCatching { CredentialVault(it).clear(account) } }
         runCatching { rosterStore?.clear() }
         runCatching { messageStore?.clear() }
-        threads.value = emptyMap()
+        threads.value = ShardedMap.empty()
         close()
     }
 
@@ -913,7 +987,7 @@ public class TetherChat(
             val before = all[peer].orEmpty()
             val (after, toSave) = change(before)
             changed = if (after === before || messageStore == null) emptyList() else toSave
-            if (after === before) all else all + (peer to after)
+            if (after === before) all else all.with(peer, after)
         }
         changed.forEach { saves.trySend(it to false) }
     }
@@ -938,18 +1012,18 @@ public class TetherChat(
         // Many chats at once (a store load, an archive page): one change for all of them.
         var changed = emptyList<Message>()
         threads.update { all ->
-            val result = HashMap(all)
+            var result = all
             val toSave = ArrayList<Message>()
             for ((peer, batch) in groups) {
                 val before = all[peer].orEmpty()
                 val (after, save) = mergeInto(before, batch, saveAdded, combine)
                 if (after !== before) {
-                    result[peer] = after
+                    result = result.with(peer, after)
                     toSave += save
                 }
             }
             changed = if (messageStore == null) emptyList() else toSave
-            if (result.size == all.size && result.all { (peer, list) -> all[peer] === list }) all else result
+            result
         }
         changed.forEach { saves.trySend(it to false) }
     }
@@ -1034,7 +1108,7 @@ public class TetherChat(
                 while (cut > 0 && list[cut - 1].timestamp == list[cut].timestamp) cut--
                 if (cut <= 0) return@update all.also { cutAt = null }
                 cutAt = list[cut].timestamp
-                all + (peer to list.subList(cut, list.size).toList())
+                all.with(peer, list.subList(cut, list.size).toList())
             }
             val time = cutAt ?: return
             storeCursors[peer] = MessagePosition(time, "")
@@ -1069,15 +1143,18 @@ public class TetherChat(
             return
         }
         var after: String = newest
-        repeat(CATCH_UP_PAGES) {
+        var left = features.catchUpLimit
+        while (left > 0) {
+            val max = minOf(PAGE, left)
             val page = try {
-                im.history.fetch(after = after, max = PAGE)
+                im.history.fetch(after = after, max = max)
             } catch (e: XmppStanzaException) {
                 // The archive no longer has our newest message: start from its newest page.
                 importPage(im.history.fetch(max = PAGE), unread = false)
                 return
             }
             importPage(page, unread = true)
+            left -= max
             after = page.last ?: return
             if (page.complete) return
         }
@@ -1130,14 +1207,13 @@ public class TetherChat(
         override suspend fun onSessionStarted(session: SessionContext) {
             val firstInProcess = first
             first = false
-            if (!features.history || (session.resumed && !firstInProcess)) return
+            if (!features.history || features.catchUpLimit <= 0 || (session.resumed && !firstInProcess)) return
             scope.launch { runCatching { catchUp() } }
         }
     }
 
     internal companion object {
         const val PAGE = 50
-        const val CATCH_UP_PAGES = 10
         const val SMALL_BATCH = 8
 
         /** Messages per chat read from a paged store at startup, and kept when a chat closes. */
@@ -1180,16 +1256,21 @@ public class TetherChat(
          * object, so collectors of one chat see nothing when another changes.
          */
         fun visibleOnly(): (Map<BareJid, List<Message>>) -> Map<BareJid, List<Message>> {
-            var last: Pair<Map<BareJid, List<Message>>, Map<BareJid, List<Message>>>? = null
-            return { all ->
+            var last: Pair<ShardedMap<BareJid, List<Message>>, ShardedMap<BareJid, List<Message>>>? = null
+            return { input ->
+                val all = ShardedMap.of(input)
                 val previous = last
-                val result = all.mapValues { (peer, list) ->
-                    if (previous != null && previous.first[peer] === list) {
-                        previous.second.getValue(peer)
-                    } else if (list.none { it.hidden }) {
-                        list
-                    } else {
-                        list.filterNot { it.hidden }
+                // Only the parts of the map that changed are filtered again.
+                val result = all.mapShards(previous?.first, previous?.second) { shard ->
+                    shard.mapValues { (peer, list) ->
+                        val before = previous?.first?.get(peer)
+                        if (before === list) {
+                            previous.second.getValue(peer)
+                        } else if (list.none { it.hidden }) {
+                            list
+                        } else {
+                            list.filterNot { it.hidden }
+                        }
                     }
                 }
                 last = all to result
