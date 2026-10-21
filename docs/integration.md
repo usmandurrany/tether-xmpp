@@ -9,6 +9,7 @@ This guide shows how to add Tether to an Android or JVM app. Most apps only need
 | `tether-core` | `XmppClient`: login, reconnection, stream resumption, outbox, saved state |
 | `tether-im` | `TetherChat`, plus the protocol-level features: roster, presence, messages (receipts, read markers, typing, carbons), history (MAM), push |
 | `tether-android` | Android wiring: DNS, TLS (Conscrypt), app lifecycle, network changes, encrypted storage. Brings `tether-im` with it. |
+| `tether-debug` | Optional. Redacted stanza logging to the console, an in-app screen or a self-hosted log portal; see [debug-tools.md](debug-tools.md). |
 
 `tether-xml`, `tether-sasl`, `tether-crypto` and `tether-transport` come in as dependencies of `tether-core`.
 
@@ -239,6 +240,7 @@ A message shows SENT (one tick) only once the server has confirmed it (XEP-0198 
 
 - Unconfirmed messages stay queued. A resumed session re-sends what the server says it missed; a new session sends all of them first. The queue survives an app restart.
 - Right after each chat message the SDK asks the server to confirm and checks that the connection answers. A connection that has silently died (common after a network switch) is found within 10 seconds (20 in the background), replaced, and the message goes out again. Wake-ups, network changes and coming to the foreground check it too.
+- Going to the background does not strand anything. Before the clean close, the client tells the server it is active again, so a server that was holding stanzas for an inactive client (MongooseIM does) sends them, and the close waits until everything sent so far is read and confirmed.
 - A re-send can reach the contact twice. `TetherChat` merges copies by message id; other apps may show both.
 
 Without stream management the server never confirms anything, so a message counts as sent once it is written. Use a server with XEP-0198 (see the [server checklist](#server-checklist)).
@@ -481,6 +483,8 @@ scope.launch {
 
 `connect()` returns once the first attempt finishes, with `ConnectResult.Connected`, `Failed` or `Cancelled`. After that, Tether keeps reconnecting on its own until `disconnect()`. Only a `Terminal` state needs the user (or a new `connect()`).
 
+A certificate that TLS refused is terminal. A handshake that fails because the network reset or stalled is not: it is retried like any other connection error, and a handshake that gets no answer gives up after `TlsConfig.handshakeTimeoutMillis` (15 s).
+
 ### Messages
 
 ```kotlin
@@ -538,6 +542,7 @@ History needs `mod_mam` (MongooseIM, ejabberd) or the Openfire Monitoring plugin
 
 - SCRAM-SHA-256 and SCRAM-SHA-512, with channel binding when the server supports it, are the defaults.
 - PLAIN is off by default. Turn it on with `XmppConfig(sasl = SaslConfig(allowPlain = true))`. It still requires verified TLS.
+- Timeouts: `TlsConfig(connectTimeoutMillis = 10_000, handshakeTimeoutMillis = 15_000)` are the defaults, per address and per TLS handshake.
 - Self-signed server certificates: pin them with `TlsConfig(pinnedCertificateSha256 = setOf("<sha-256 hex>"))`. When `connect()` returns `ConnectResult.Failed`, its `untrustedCertificate` holds the fingerprint of a certificate TLS refused, to show the user ("trust this server?") and pin. `./gradlew :tools:probe:run` prints it too.
 
 ## Server checklist
