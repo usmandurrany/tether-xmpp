@@ -115,8 +115,9 @@ public class OutboxFullException(public val stanza: Element) : Exception("The ou
  * - With a [store], unconfirmed stanzas, the outbox, the session to resume
  *   and learned keepalive timing survive a restart of the app. It is saved
  *   shortly after every change and at once when the app goes to the background.
- * - With [credentials], the SCRAM keys of each login are saved there, so the
- *   next run can log in without the password.
+ * - With [credentials], the SCRAM keys of each login, and the FAST token when
+ *   the server offers FAST (XEP-0484), are saved there, so the next run can
+ *   log in without the password.
  *
  * Use one client per account per process.
  */
@@ -175,6 +176,10 @@ public class XmppClient(
     public val confirmed: SharedFlow<Element> = _confirmed.asSharedFlow()
 
     init {
+        // FAST tokens (XEP-0484) are saved as soon as the server issues, rotates or refuses one.
+        credentials?.let { vault ->
+            negotiator.onFastTokenChanged = { token -> runCatching { vault.saveFastToken(account, token) } }
+        }
         // One reporter, so active and inactive reach the server in the order they happened.
         scope.launch {
             _foreground.collect { fg -> _session.value?.let { reportActivity(it, fg) } }

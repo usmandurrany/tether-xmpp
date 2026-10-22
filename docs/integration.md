@@ -466,11 +466,7 @@ class ChatApp : Application() {
     suspend fun signIn(jid: String, typedPassword: String?): ConnectResult {
         val account = BareJid.parse(jid)
         val store = TetherAndroid.secureStore(this)
-        val config = XmppConfig(
-            jid = account,
-            password = typedPassword,                             // only on first login
-            scramKeys = CredentialVault(store).loadKeys(account), // later logins
-        )
+        val config = ConnectionOptions().configFor(account, typedPassword, CredentialVault(store)) // saved login when no password
         client = TetherAndroid.client(this, config, scope, store = store)
         im = InstantMessaging(client, rosterStore = StoredRoster(store, account))
         return client.connect()
@@ -482,9 +478,9 @@ class ChatApp : Application() {
 
 - It follows the app lifecycle. Five seconds after the app goes to the background the connection is closed cleanly, so the server sends push notifications. It reconnects (or resumes) when the app comes back.
 - It follows network changes. A lost network pauses retries, and a new one reconnects at once.
-- It keeps state in the Android Keystore-encrypted store: the stream-resumption token, unconfirmed and unsent messages, keepalive timings, and the SCRAM login keys.
+- It keeps state in the Android Keystore-encrypted store: the stream-resumption token, unconfirmed and unsent messages, keepalive timings, the SCRAM login keys and the FAST login token.
 
-The password is never stored. After the first successful login, Tether saves the derived SCRAM keys, and `CredentialVault.loadKeys` returns them for later logins. On logout, call `client.disconnect()`, `client.close()` and `CredentialVault(store).clear(account)`.
+The password is never stored. After the first successful login, Tether saves the derived SCRAM keys and, when the server offers FAST, a login token; `ConnectionOptions.configFor` (or `CredentialVault.loadKeys` and `loadFastToken`) returns them for later logins. On logout, call `client.disconnect()`, `client.close()` and `CredentialVault(store).clear(account)`.
 
 Permissions (`INTERNET`, `ACCESS_NETWORK_STATE`) come from the library manifest.
 
@@ -578,6 +574,7 @@ History needs `mod_mam` (MongooseIM, ejabberd) or the Openfire Monitoring plugin
 
 - SCRAM-SHA-256 and SCRAM-SHA-512, with channel binding when the server supports it, are the defaults.
 - PLAIN is off by default. Turn it on with `XmppConfig(sasl = SaslConfig(allowPlain = true))`. It still requires verified TLS.
+- SASL2 (XEP-0388) and FAST (XEP-0484) are used on their own when the server offers them. Each password or saved-key login asks the server for a FAST token, and later logins (reconnects and app restarts) use the token first: one round trip, bound to the TLS connection when the server offers an `-ENDP` or `-EXPR` mechanism. A refused token is forgotten and the login falls back to the saved keys or the password. The token is tied to this installation through `UserAgent.id`, which `CredentialVault` keeps; pass a device name with `ConnectionOptions(device = "Pixel 8")` if you like. Turn either off with `SaslConfig(useSasl2 = false)` or `SaslConfig(useFast = false)`.
 - Timeouts: `TlsConfig(connectTimeoutMillis = 10_000, handshakeTimeoutMillis = 15_000)` are the defaults, per address and per TLS handshake.
 - Self-signed server certificates: pin them with `TlsConfig(pinnedCertificateSha256 = setOf("<sha-256 hex>"))`. When `connect()` returns `ConnectResult.Failed`, its `untrustedCertificate` holds the fingerprint of a certificate TLS refused, to show the user ("trust this server?") and pin. `./gradlew :tools:probe:run` prints it too.
 
@@ -587,6 +584,7 @@ Tether checks the server's capabilities before turning on any feature, so a miss
 
 - STARTTLS, required (or direct TLS on 5223)
 - Stream management (XEP-0198), with resumption
+- SASL2 (XEP-0388) with FAST (XEP-0484), optional, for one-round-trip logins without the password (`mod_sasl2` and `mod_sasl2_fast` on Prosody; `mod_fast_auth_token` on MongooseIM)
 - Message archive (XEP-0313)
 - Message carbons (XEP-0280)
 - Client state indication (XEP-0352)

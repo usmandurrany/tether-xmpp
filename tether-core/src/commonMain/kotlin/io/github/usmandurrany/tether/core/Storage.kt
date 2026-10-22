@@ -1,5 +1,6 @@
 package io.github.usmandurrany.tether.core
 
+import io.github.usmandurrany.tether.sasl.FastToken
 import io.github.usmandurrany.tether.sasl.ScramAlgorithm
 import io.github.usmandurrany.tether.sasl.ScramKeys
 import kotlinx.coroutines.sync.Mutex
@@ -32,9 +33,10 @@ public class MemoryKeyValueStore : KeyValueStore {
 
 /**
  * The account's login secrets, so the app can log in again without asking for
- * the password. After the first login only the SCRAM keys (RFC 5802) are kept,
- * not the password: they work for this server only and cannot be turned back
- * into the password, but they still log in, so the store must be encrypted.
+ * the password. After the first login only the SCRAM keys (RFC 5802) and, when
+ * the server offers FAST (XEP-0484), a login token are kept, never the
+ * password: they work for this server only and cannot be turned back into the
+ * password, but they still log in, so the store must be encrypted.
  */
 public class CredentialVault(private val store: KeyValueStore) {
     /** Saves the keys a login derived (see [XmppClient.scramKeys]). */
@@ -66,13 +68,48 @@ public class CredentialVault(private val store: KeyValueStore) {
         }.getOrDefault(emptyList())
     }
 
-    /** True when an earlier login saved keys for [account], so it can log in without the password. */
-    public suspend fun hasKeys(account: BareJid): Boolean = loadKeys(account).isNotEmpty()
+    /** Saves the FAST token the server issued, or forgets it when [token] is null. */
+    public suspend fun saveFastToken(account: BareJid, token: FastToken?) {
+        val line = token?.let {
+            listOfNotNull(it.mechanism, Base64.Default.encode(it.token.encodeToByteArray()), it.expiry).joinToString(" ")
+        }
+        store.put(fastKeyFor(account), line)
+    }
+
+    /** The stored FAST token, or null (also for unreadable data). */
+    public suspend fun loadFastToken(account: BareJid): FastToken? {
+        val line = store.get(fastKeyFor(account)) ?: return null
+        return runCatching {
+            val parts = line.split(" ")
+            FastToken(parts[0], Base64.Default.decode(parts[1]).decodeToString(), parts.getOrNull(2))
+        }.getOrNull()
+    }
+
+    /**
+     * The SASL2 user-agent id for [account] on this installation, made on
+     * first use. FAST tokens only work with the id they were issued to.
+     */
+    public suspend fun userAgentId(account: BareJid): String {
+        store.get(agentKeyFor(account))?.let { return it }
+        return UserAgent.randomUuid().also { store.put(agentKeyFor(account), it) }
+    }
+
+    /**
+     * True when an earlier login saved SCRAM keys or a FAST token for
+     * [account], so it can log in without the password.
+     */
+    public suspend fun hasKeys(account: BareJid): Boolean =
+        loadKeys(account).isNotEmpty() || loadFastToken(account) != null
 
     /** Forgets the account's secrets, for example on logout. */
     public suspend fun clear(account: BareJid) {
         store.put(keyFor(account), null)
+        store.put(fastKeyFor(account), null)
     }
 
     private fun keyFor(account: BareJid) = "tether.scram.$account"
+
+    private fun fastKeyFor(account: BareJid) = "tether.fast.$account"
+
+    private fun agentKeyFor(account: BareJid) = "tether.agent.$account"
 }

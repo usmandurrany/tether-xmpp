@@ -28,6 +28,13 @@ public data class SaslConfig(
     /** Preference order. Entries the policy does not allow are skipped. */
     public val mechanismOrder: List<String> = DEFAULT_ORDER,
     public val scramLimits: ScramLimits = ScramLimits(),
+    /** Log in through SASL2 (XEP-0388) when the server offers it. Off: always classic SASL. */
+    public val useSasl2: Boolean = true,
+    /**
+     * Ask for a FAST token (XEP-0484) on each SASL2 login and log in with it
+     * next time, when the server offers FAST. Needs [useSasl2].
+     */
+    public val useFast: Boolean = true,
 ) {
     public companion object {
         public val DEFAULT_ORDER: List<String> = listOf(

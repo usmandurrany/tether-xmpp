@@ -54,10 +54,9 @@ fun main(args: Array<String>) {
     }
 
     println("Probing ${config.jid} ...")
+    val negotiator = StreamNegotiator(config, JvmSocketTransportFactory(config.tls), EndpointResolver(JndiSrvLookup()), logger)
     val session = try {
-        runBlocking {
-            StreamNegotiator(config, JvmSocketTransportFactory(config.tls), EndpointResolver(JndiSrvLookup()), logger).negotiate()
-        }
+        runBlocking { negotiator.negotiate() }
     } catch (e: XmppNegotiationException) {
         println("\nFAILED: ${e.message}")
         val tls = generateSequence<Throwable>(e) { it.cause }.filterIsInstance<TlsVerificationException>().firstOrNull()
@@ -74,6 +73,9 @@ fun main(args: Array<String>) {
     println("TLS: ${session.tls.protocol}, ${session.tls.cipherSuite}${if (session.tls.pinned) " (pinned certificate)" else ""}")
     println("Server certificate SHA-256: ${session.tls.peerCertificateSha256}")
     println("SASL mechanism used: ${session.saslMechanism}${if (session.channelBound) " (channel-bound)" else ""}")
+    val sasl2 = session.featuresAfterTls.child("authentication", "urn:xmpp:sasl:2") != null
+    println("SASL2 (XEP-0388): ${if (sasl2) "offered, used for this login" else "not offered"}")
+    println("FAST (XEP-0484): ${negotiator.fastToken?.let { "token issued for ${it.mechanism}" } ?: "no token issued"}")
     session.featuresBeforeTls?.let { section("Stream features before TLS", describe(it)) }
     section("Stream features after TLS (pre-auth)", describe(session.featuresAfterTls))
     section("Stream features after login", describe(session.capabilities.streamFeatures))
@@ -89,12 +91,15 @@ private fun section(title: String, lines: List<String>) {
 /** One line per top-level feature with its namespace, plus notable children (mechanisms, binding types, ...). */
 private fun describe(features: Element): List<String> = features.elements.flatMap { feature ->
     val head = "${feature.name} [${feature.namespace}]"
-    val detail = feature.elements.map { child ->
-        val text = child.text.trim()
-        val attrs = child.attributes.joinToString(" ") { "${it.name}=${it.value}" }
-        "    - ${child.name}${if (text.isNotEmpty()) ": $text" else ""}${if (attrs.isNotEmpty()) " ($attrs)" else ""}"
-    }
-    listOf(head) + detail
+    listOf(head) + feature.elements.flatMap { detail(it, "    ") }
+}
+
+/** A child and its descendants (SASL2 nests inline features such as FAST two levels down). */
+private fun detail(child: Element, indent: String): List<String> {
+    val text = child.text.trim()
+    val attrs = child.attributes.joinToString(" ") { "${it.name}=${it.value}" }
+    val line = "$indent- ${child.name}${if (text.isNotEmpty()) ": $text" else ""}${if (attrs.isNotEmpty()) " ($attrs)" else ""}"
+    return listOf(line) + child.elements.flatMap { detail(it, "$indent  ") }
 }
 
 private fun describe(info: DiscoInfo): List<String> {
