@@ -6,6 +6,8 @@ internal object Ns {
     const val STREAM_ERRORS = "urn:ietf:params:xml:ns:xmpp-streams"
     const val TLS = "urn:ietf:params:xml:ns:xmpp-tls"
     const val SASL = "urn:ietf:params:xml:ns:xmpp-sasl"
+    const val SASL2 = "urn:xmpp:sasl:2"
+    const val FAST = "urn:xmpp:fast:0"
     const val SASL_CB = "urn:xmpp:sasl-cb:0"
     const val BIND = "urn:ietf:params:xml:ns:xmpp-bind"
     const val SESSION = "urn:ietf:params:xml:ns:xmpp-session"

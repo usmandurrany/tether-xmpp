@@ -83,7 +83,22 @@ internal class FakeXmppServer(
     @Volatile var lostInTransit: Int = 0,
     /** Serve TLS through Conscrypt and offer `tls-exporter` channel binding. */
     val conscrypt: Boolean = false,
+    /** Offer SASL2 (XEP-0388) next to classic SASL. */
+    val sasl2: Boolean = false,
+    /** FAST (XEP-0484) mechanisms offered inline in SASL2; empty: no FAST. */
+    val fastMechanisms: List<String> = emptyList(),
+    /** Refuse every FAST token, as after the server dropped them. */
+    @Volatile var rejectFast: Boolean = false,
+    /** Hand out a new token on each FAST login, as when a token is close to expiry. */
+    @Volatile var rotateTokens: Boolean = false,
 ) : AutoCloseable {
+    /** Valid FAST tokens: token to (mechanism, user-agent id). */
+    val tokens = java.util.concurrent.ConcurrentHashMap<String, Pair<String, String>>()
+    /** Every SASL2 `<authenticate/>` the client sent. */
+    val authenticates = LinkedBlockingQueue<Element>()
+    @Volatile var fastLogins = 0
+    @Volatile var lastStreamFrom: String? = null
+    private var tokenCounter = 0
     /** Sent just before the answer to an IQ addressed to the account, like archive results before `<fin/>`. */
     @Volatile var beforeAccountAnswer: List<String> = emptyList()
 
@@ -216,26 +231,36 @@ internal class FakeXmppServer(
         c.restart()
 
         // Stream 2: TLS, authenticate.
-        check(c.next() is StreamHeader)
+        lastStreamFrom = (c.next() as StreamHeader).from
         c.send(header())
         val mechs = mechanisms.joinToString("") { "<mechanism>$it</mechanism>" }
         val types = if (conscrypt) "<channel-binding type='tls-exporter'/><channel-binding type='tls-server-end-point'/>" else "<channel-binding type='tls-server-end-point'/>"
         val cb = if (advertiseChannelBinding) "<sasl-channel-binding xmlns='urn:xmpp:sasl-cb:0'>$types</sasl-channel-binding>" else ""
-        c.send("<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>$mechs</mechanisms>$cb</stream:features>")
-        val auth = c.element()
-        check(auth.name == "auth")
-        usedMechanism = auth.attribute("mechanism")
-        if (rejectLogin) {
-            c.send("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/><text>bad password</text></failure>")
-            c.next()
-            return
-        }
-        scram(c, Base64.Default.decode(auth.text))
-        c.restart()
+        val fast = if (fastMechanisms.isEmpty()) "" else
+            "<inline><fast xmlns='urn:xmpp:fast:0'>${fastMechanisms.joinToString("") { "<mechanism>$it</mechanism>" }}</fast></inline>"
+        val sasl2Feature = if (sasl2) "<authentication xmlns='urn:xmpp:sasl:2'>$mechs$fast</authentication>" else ""
+        c.send("<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>$mechs</mechanisms>$cb$sasl2Feature</stream:features>")
+        val first = c.element()
+        if (first.name == "authenticate") {
+            if (!sasl2Login(c, first)) return
+            // No stream restart after SASL2: the features follow at once.
+        } else {
+            val auth = first
+            check(auth.name == "auth")
+            usedMechanism = auth.attribute("mechanism")
+            if (rejectLogin) {
+                c.send("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/><text>bad password</text></failure>")
+                c.next()
+                return
+            }
+            val serverFinal = scram(c, Base64.Default.decode(auth.text), SASL) ?: return
+            c.send("<success xmlns='$SASL'>${Base64.Default.encode(serverFinal)}</success>")
+            c.restart()
 
-        // Stream 3: authenticated.
-        check(c.next() is StreamHeader)
-        c.send(header())
+            // Stream 3: authenticated.
+            check(c.next() is StreamHeader)
+            c.send(header())
+        }
         if (streamErrorAfterAuth != null) {
             c.send("<stream:error><$streamErrorAfterAuth xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>")
             return
@@ -313,8 +338,79 @@ internal class FakeXmppServer(
         }
     }
 
-    /** SCRAM-SHA-256 server side, from RFC 5802, independent of the client implementation. */
-    private fun scram(c: Conn, clientFirst: ByteArray) {
+    /**
+     * SASL2 login, retried on the same stream after a `<failure/>`, as real
+     * servers allow. Returns false when the client went away.
+     */
+    private fun sasl2Login(c: Conn, first: Element): Boolean {
+        var next: Element? = first
+        while (true) {
+            val auth = next ?: (c.next() as? Element ?: return false)
+            next = null
+            check(auth.name == "authenticate" && auth.namespace == SASL2) { "expected <authenticate/>, got $auth" }
+            authenticates += auth
+            val mechanism = auth.attribute("mechanism")!!
+            usedMechanism = mechanism
+            val agent = auth.child("user-agent")?.attribute("id").orEmpty()
+            val initial = Base64.Default.decode(auth.child("initial-response")!!.text)
+            val additional: ByteArray
+            var token: String? = null
+            if (mechanism.startsWith("HT-")) {
+                check(auth.child("fast", FAST) != null) { "a token login must carry <fast/>" }
+                val split = initial.indexOf(0)
+                check(initial.copyOfRange(0, split).decodeToString() == "juliet")
+                val proof = initial.copyOfRange(split + 1, initial.size)
+                val cb = htBinding(c, mechanism)
+                val match = tokens.entries.firstOrNull { (t, owner) ->
+                    owner == (mechanism to agent) &&
+                        Crypto.hmac(HashAlgorithm.SHA256, t.encodeToByteArray(), "Initiator".encodeToByteArray() + cb).contentEquals(proof)
+                }
+                if (rejectFast || match == null) {
+                    c.send("<failure xmlns='$SASL2'><credentials-expired xmlns='$SASL'/><text>token not accepted</text></failure>")
+                    continue
+                }
+                fastLogins++
+                additional = Crypto.hmac(HashAlgorithm.SHA256, match.key.encodeToByteArray(), "Responder".encodeToByteArray() + cb)
+                if (rotateTokens) token = issue(mechanism, agent)
+            } else {
+                if (rejectLogin) {
+                    c.send("<failure xmlns='$SASL2'><not-authorized xmlns='$SASL'/><text>bad password</text></failure>")
+                    continue
+                }
+                additional = scram(c, initial, SASL2) ?: return false
+                auth.child("request-token", FAST)?.attribute("mechanism")?.let { requested ->
+                    check(requested in fastMechanisms) { "token requested for $requested, which was not offered" }
+                    token = issue(requested, agent)
+                }
+            }
+            val tokenXml = token?.let { "<token xmlns='$FAST' expiry='2030-01-01T00:00:00Z' token='$it'/>" }.orEmpty()
+            c.send(
+                "<success xmlns='$SASL2'><additional-data>${Base64.Default.encode(additional)}</additional-data>" +
+                    "<authorization-identifier>juliet@localhost</authorization-identifier>$tokenXml</success>",
+            )
+            return true
+        }
+    }
+
+    private fun issue(mechanism: String, agent: String): String {
+        // XEP-0484: a new token replaces the client's older ones.
+        tokens.entries.removeIf { it.value.second == agent }
+        val token = "token-${++tokenCounter}-${System.nanoTime()}"
+        tokens[token] = mechanism to agent
+        return token
+    }
+
+    private fun htBinding(c: Conn, mechanism: String): ByteArray = when {
+        mechanism.endsWith("-ENDP") -> MessageDigest.getInstance("SHA-256").digest(TestCertificate.der)
+        mechanism.endsWith("-EXPR") -> Conscrypt.exportKeyingMaterial(c.ssl!!, "EXPORTER-Channel-Binding", null, 32)
+        else -> ByteArray(0)
+    }
+
+    /**
+     * SCRAM-SHA-256 server side, from RFC 5802, independent of the client
+     * implementation. Returns the server-final message, or null after sending a failure.
+     */
+    private fun scram(c: Conn, clientFirst: ByteArray, ns: String): ByteArray? {
         val text = clientFirst.decodeToString()
         val gs2 = text.substring(0, text.indexOf(',', text.indexOf(',') + 1) + 1)
         usedGs2Header = gs2
@@ -322,7 +418,7 @@ internal class FakeXmppServer(
         val clientNonce = bare.substringAfter("r=")
         val salt = "fake-salt-1234".encodeToByteArray()
         val serverFirst = "r=${clientNonce}srv,s=${Base64.Default.encode(salt)},i=4096"
-        c.send("<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>${Base64.Default.encode(serverFirst.encodeToByteArray())}</challenge>")
+        c.send("<challenge xmlns='$ns'>${Base64.Default.encode(serverFirst.encodeToByteArray())}</challenge>")
 
         val final = Base64.Default.decode(c.element().text).decodeToString()
         val withoutProof = final.substringBefore(",p=")
@@ -343,12 +439,17 @@ internal class FakeXmppServer(
         val proof = Base64.Default.decode(final.substringAfter(",p="))
         val recovered = ByteArray(proof.size) { (proof[it].toInt() xor signature[it].toInt()).toByte() }
         if (!Crypto.hash(h, recovered).contentEquals(storedKey)) {
-            c.send("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>")
+            c.send("<failure xmlns='$ns'><not-authorized${if (ns == SASL) "" else " xmlns='$SASL'"}/></failure>")
             error("client proof invalid")
         }
         val serverSignature = Crypto.hmac(h, Crypto.hmac(h, salted, "Server Key".encodeToByteArray()), authMessage)
-        val serverFinal = "v=${Base64.Default.encode(serverSignature)}"
-        c.send("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>${Base64.Default.encode(serverFinal.encodeToByteArray())}</success>")
+        return "v=${Base64.Default.encode(serverSignature)}".encodeToByteArray()
+    }
+
+    private companion object {
+        const val SASL = "urn:ietf:params:xml:ns:xmpp-sasl"
+        const val SASL2 = "urn:xmpp:sasl:2"
+        const val FAST = "urn:xmpp:fast:0"
     }
 
     private fun header() =

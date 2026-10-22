@@ -1,5 +1,6 @@
 package io.github.usmandurrany.tether.core
 
+import io.github.usmandurrany.tether.sasl.FastToken
 import io.github.usmandurrany.tether.sasl.ScramAlgorithm
 import io.github.usmandurrany.tether.sasl.ScramKeys
 import io.github.usmandurrany.tether.xml.element
@@ -7,6 +8,7 @@ import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -61,5 +63,33 @@ class StorageTest {
         assertContentEquals(byteArrayOf(4, 5), keys.clientKey)
         vault.clear(jid)
         assertTrue(vault.loadKeys(jid).isEmpty())
+    }
+
+    @Test
+    fun fastTokenRoundTripAndClear() = runTest {
+        val vault = CredentialVault(MemoryKeyValueStore())
+        val jid = BareJid.parse("juliet@example.com")
+        assertFalse(vault.hasKeys(jid))
+        vault.saveFastToken(jid, FastToken("HT-SHA-256-ENDP", "tok en/with spaces", "2030-01-01T00:00:00Z"))
+        val token = vault.loadFastToken(jid)!!
+        assertEquals("HT-SHA-256-ENDP", token.mechanism)
+        assertEquals("tok en/with spaces", token.token)
+        assertEquals("2030-01-01T00:00:00Z", token.expiry)
+        assertTrue(vault.hasKeys(jid), "a token is a saved login too")
+        vault.saveFastToken(jid, FastToken("HT-SHA-256-NONE", "t", null))
+        assertNull(vault.loadFastToken(jid)!!.expiry)
+        vault.clear(jid)
+        assertNull(vault.loadFastToken(jid))
+    }
+
+    @Test
+    fun userAgentIdIsStableUuidV4() = runTest {
+        val vault = CredentialVault(MemoryKeyValueStore())
+        val jid = BareJid.parse("juliet@example.com")
+        val id = vault.userAgentId(jid)
+        assertTrue(Regex("[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}").matches(id), id)
+        assertEquals(id, vault.userAgentId(jid))
+        vault.clear(jid)
+        assertEquals(id, vault.userAgentId(jid), "the installation id outlives a sign-out")
     }
 }
